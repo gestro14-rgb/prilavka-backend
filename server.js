@@ -11,6 +11,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
+const YANDEX_GEOCODER_API_KEY = process.env.YANDEX_GEOCODER_API_KEY || '';
 
 // ============================================================
 // Вспомогательные функции
@@ -52,6 +53,51 @@ function requireAuth(req, res, next) {
   }
 }
 
+// Геокодирование адреса через Яндекс Geocoder HTTP API.
+// Возвращает { lat, lng, formatted } или null, если адрес не найден.
+async function geocodeAddress(address) {
+  if (!YANDEX_GEOCODER_API_KEY) {
+    throw new Error('YANDEX_GEOCODER_API_KEY не настроен на сервере');
+  }
+  const url = new URL('https://geocode-maps.yandex.ru/1.x/');
+  url.searchParams.set('apikey', YANDEX_GEOCODER_API_KEY);
+  url.searchParams.set('geocode', address);
+  url.searchParams.set('format', 'json');
+  url.searchParams.set('results', '1');
+
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Геокодер вернул ошибку: ${res.status}`);
+  }
+  const data = await res.json();
+  const member = data?.response?.GeoObjectCollection?.featureMember;
+  if (!member || member.length === 0) return null;
+
+  const geoObject = member[0].GeoObject;
+  const [lngStr, latStr] = geoObject.Point.pos.split(' ');
+  return {
+    lat: parseFloat(latStr),
+    lng: parseFloat(lngStr),
+    formatted: geoObject.metaDataProperty?.GeocoderMetaData?.text || address,
+  };
+}
+
+// Проверка "точка внутри многоугольника" (алгоритм ray-casting).
+// polygon — массив точек [[lat, lng], ...], point — {lat, lng}.
+function isPointInPolygon(point, polygon) {
+  if (!Array.isArray(polygon) || polygon.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const [xi, yi] = polygon[i];
+    const [xj, yj] = polygon[j];
+    const intersects =
+      yi > point.lng !== yj > point.lng &&
+      point.lat < ((xj - xi) * (point.lng - yi)) / (yj - yi) + xi;
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
 // ============================================================
 // Публичные маршруты (используются мини-приложением)
 // ============================================================
@@ -90,6 +136,54 @@ app.get('/api/catalog', async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
+// Проверка зоны доставки
+// ============================================================
+
+// Принимает { address } (текстовый адрес) или { lat, lng } (координаты, например с геолокации).
+// Геокодирует адрес при необходимости, затем проверяет попадание в зоны доставки.
+app.post('/api/check-zone', async (req, res) => {
+  const { address, lat, lng } = req.body || {};
+
+  try {
+    let point;
+    let formattedAddress = address;
+
+    if (typeof lat === 'number' && typeof lng === 'number') {
+      point = { lat, lng };
+    } else if (address && address.trim()) {
+      const geocoded = await geocodeAddress(address.trim());
+      if (!geocoded) {
+        return res.json({ inZone: false, found: false, message: 'Адрес не найден' });
+      }
+      point = { lat: geocoded.lat, lng: geocoded.lng };
+      formattedAddress = geocoded.formatted;
+    } else {
+      return res.status(400).json({ error: 'Укажите address или lat/lng' });
+    }
+
+    const zonesRes = await query('SELECT * FROM delivery_zones WHERE is_active = true');
+    let matchedZone = null;
+    for (const zone of zonesRes.rows) {
+      if (isPointInPolygon(point, zone.coordinates)) {
+        matchedZone = zone;
+        break;
+      }
+    }
+
+    res.json({
+      inZone: Boolean(matchedZone),
+      found: true,
+      address: formattedAddress,
+      zone: matchedZone ? matchedZone.label : null,
+      point,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message || 'Ошибка сервера' });
   }
 });
 
@@ -264,6 +358,7 @@ app.get('/api/admin/categories', requireAuth, async (req, res) => {
     const result = await query('SELECT * FROM categories ORDER BY sort_order ASC');
     res.json(result.rows);
   } catch (e) {
+  } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
   }
@@ -296,6 +391,85 @@ app.delete('/api/admin/categories/:id', requireAuth, async (req, res) => {
     if (e.code === '23503') {
       return res.status(409).json({ error: 'Нельзя удалить категорию: в ней есть товары' });
     }
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
+// Админские маршруты — зоны доставки
+// ============================================================
+
+// Список всех зон (включая неактивные) — для админки
+app.get('/api/admin/delivery-zones', requireAuth, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM delivery_zones ORDER BY id ASC');
+    res.json(
+      result.rows.map((z) => ({
+        id: z.id,
+        label: z.label,
+        coordinates: z.coordinates,
+        isActive: z.is_active,
+      }))
+    );
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Создать зону доставки (полигон)
+app.post('/api/admin/delivery-zones', requireAuth, async (req, res) => {
+  const { label, coordinates, isActive } = req.body || {};
+  if (!label || !Array.isArray(coordinates) || coordinates.length < 3) {
+    return res.status(400).json({ error: 'Укажите label и coordinates (минимум 3 точки)' });
+  }
+  try {
+    const result = await query(
+      `INSERT INTO delivery_zones (label, coordinates, is_active) VALUES ($1, $2, $3) RETURNING *`,
+      [label, JSON.stringify(coordinates), isActive !== false]
+    );
+    const z = result.rows[0];
+    res.status(201).json({ id: z.id, label: z.label, coordinates: z.coordinates, isActive: z.is_active });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Обновить зону доставки
+app.put('/api/admin/delivery-zones/:id', requireAuth, async (req, res) => {
+  const { label, coordinates, isActive } = req.body || {};
+  try {
+    const existing = await query('SELECT * FROM delivery_zones WHERE id = $1', [req.params.id]);
+    if (!existing.rows[0]) return res.status(404).json({ error: 'Зона не найдена' });
+    const cur = existing.rows[0];
+
+    const result = await query(
+      `UPDATE delivery_zones SET label = $1, coordinates = $2, is_active = $3, updated_at = now()
+       WHERE id = $4 RETURNING *`,
+      [
+        label ?? cur.label,
+        coordinates !== undefined ? JSON.stringify(coordinates) : JSON.stringify(cur.coordinates),
+        isActive ?? cur.is_active,
+        req.params.id,
+      ]
+    );
+    const z = result.rows[0];
+    res.json({ id: z.id, label: z.label, coordinates: z.coordinates, isActive: z.is_active });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Удалить зону доставки
+app.delete('/api/admin/delivery-zones/:id', requireAuth, async (req, res) => {
+  try {
+    const result = await query('DELETE FROM delivery_zones WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Зона не найдена' });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
