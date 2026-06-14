@@ -358,7 +358,6 @@ app.get('/api/admin/categories', requireAuth, async (req, res) => {
     const result = await query('SELECT * FROM categories ORDER BY sort_order ASC');
     res.json(result.rows);
   } catch (e) {
-  } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
   }
