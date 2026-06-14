@@ -1,0 +1,56 @@
+-- Схема базы данных "Прилавка"
+
+-- Категории товаров
+CREATE TABLE IF NOT EXISTS categories (
+  id TEXT PRIMARY KEY,
+  label TEXT NOT NULL,
+  sort_order INTEGER DEFAULT 0
+);
+
+-- Товары
+CREATE TABLE IF NOT EXISTS products (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  price INTEGER NOT NULL,
+  weight TEXT NOT NULL,
+  emoji TEXT NOT NULL,
+  bg TEXT NOT NULL,
+  category TEXT NOT NULL REFERENCES categories(id),
+  badge_type TEXT,
+  badge_label TEXT,
+  composition JSONB NOT NULL DEFAULT '[]',
+  suppliers JSONB NOT NULL DEFAULT '[]',
+  pricing JSONB NOT NULL DEFAULT '[]',
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  sort_order INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Отзывы (для главной страницы)
+CREATE TABLE IF NOT EXISTS reviews (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  area TEXT NOT NULL,
+  stars INTEGER NOT NULL DEFAULT 5,
+  text TEXT NOT NULL,
+  emoji TEXT NOT NULL,
+  sort_order INTEGER DEFAULT 0
+);
+
+-- Последние доставки (для главной страницы)
+CREATE TABLE IF NOT EXISTS deliveries (
+  id SERIAL PRIMARY KEY,
+  emoji TEXT NOT NULL,
+  title TEXT NOT NULL,
+  text TEXT NOT NULL,
+  sort_order INTEGER DEFAULT 0
+);
+
+-- Администраторы (для админки)
+CREATE TABLE IF NOT EXISTS admins (
+  id SERIAL PRIMARY KEY,
+  username TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
