@@ -107,13 +107,6 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true });
 });
 
-    res.json({ ok: true, message: 'Таблица delivery_zones создана (или уже существовала)' });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
 // Весь каталог (категории + товары + отзывы + доставки) — то, что раньше было в products.js
 
 app.get('/api/catalog', async (req, res) => {
