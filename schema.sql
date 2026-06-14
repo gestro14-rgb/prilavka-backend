@@ -54,3 +54,14 @@ CREATE TABLE IF NOT EXISTS admins (
   password_hash TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Зоны доставки (полигоны на карте)
+-- coordinates: массив точек [[lat, lng], [lat, lng], ...] — задаёт замкнутый многоугольник
+CREATE TABLE IF NOT EXISTS delivery_zones (
+  id SERIAL PRIMARY KEY,
+  label TEXT NOT NULL,
+  coordinates JSONB NOT NULL DEFAULT '[]',
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
