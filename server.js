@@ -107,7 +107,29 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true });
 });
 
+// ВРЕМЕННЫЙ маршрут: применяет миграцию для таблицы delivery_zones.
+// Открыть один раз в браузере после деплоя, затем можно удалить этот код.
+app.get('/api/migrate-zones', async (req, res) => {
+  try {
+    await query(`
+      CREATE TABLE IF NOT EXISTS delivery_zones (
+        id SERIAL PRIMARY KEY,
+        label TEXT NOT NULL,
+        coordinates JSONB NOT NULL DEFAULT '[]',
+        is_active BOOLEAN NOT NULL DEFAULT true,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    res.json({ ok: true, message: 'Таблица delivery_zones создана (или уже существовала)' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Весь каталог (категории + товары + отзывы + доставки) — то, что раньше было в products.js
+
 app.get('/api/catalog', async (req, res) => {
   try {
     const [categoriesRes, productsRes, reviewsRes, deliveriesRes] = await Promise.all([
