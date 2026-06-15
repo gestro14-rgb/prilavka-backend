@@ -191,9 +191,23 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true });
 });
 
- 
+// ВРЕМЕННЫЙ маршрут: обновляет пароль администратора.
+// Открыть один раз в браузере после деплоя, затем убрать этот код.
+app.get('/api/reset-password', async (req, res) => {
+  try {
+    await query('UPDATE admins SET password_hash = $1 WHERE username = $2', [
+      '$2a$10$oYEIhXG7GNPy8w3eS430N.rd.elnZ60cSFqEsI.ryWXt649R7bvMu',
+      'admin',
+    ]);
+    res.json({ ok: true, message: 'Пароль обновлён' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
 
-// Весь каталог (категории + товары + отзывы + доставки) — то, что раньше было в products.js
+// Весь каталог
+
 
 app.get('/api/catalog', async (req, res) => {
   try {
