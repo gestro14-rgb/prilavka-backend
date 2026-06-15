@@ -341,6 +341,70 @@ app.post('/api/orders', async (req, res) => {
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
+// Уровни программы лояльности по количеству заказов.
+// Каждый уровень задаёт минимальное число заказов, начиная с которого он действует.
+const LOYALTY_LEVELS = [
+  { threshold: 0, label: 'Новый сосед', emoji: '🌱' },
+  { threshold: 1, label: 'Сосед', emoji: '🏡' },
+  { threshold: 3, label: 'Постоянный гость', emoji: '🌿' },
+  { threshold: 6, label: 'Друг Прилавки', emoji: '💚' },
+  { threshold: 10, label: 'Легенда района', emoji: '🌟' },
+];
+
+// Возвращает текущий уровень и сведения о следующем (если есть) по числу заказов.
+function getLoyaltyLevel(ordersCount) {
+  let current = LOYALTY_LEVELS[0];
+  let currentThreshold = LOYALTY_LEVELS[0].threshold;
+  let next = null;
+  for (let i = 0; i < LOYALTY_LEVELS.length; i++) {
+    if (ordersCount >= LOYALTY_LEVELS[i].threshold) {
+      current = LOYALTY_LEVELS[i];
+      currentThreshold = LOYALTY_LEVELS[i].threshold;
+      next = LOYALTY_LEVELS[i + 1] || null;
+    }
+  }
+  const ordersToNext = next ? next.threshold - ordersCount : 0;
+  return {
+    label: current.label,
+    emoji: current.emoji,
+    currentThreshold,
+    next: next ? { label: next.label, emoji: next.emoji, threshold: next.threshold, ordersToNext } : null,
+  };
+}
+
+// Статистика пользователя для программы лояльности: уровень, эко-счётчик.
+// Считается по числу заказов пользователя (telegram_user_id).
+app.get('/api/users/:telegramId/stats', async (req, res) => {
+  const telegramId = req.params.telegramId;
+  if (!telegramId || telegramId === '0') {
+    return res.json({
+      ordersCount: 0,
+      level: getLoyaltyLevel(0),
+      eco: { packagingSaved: 0, co2SavedKg: 0 },
+    });
+  }
+  try {
+    const result = await query(
+      'SELECT COUNT(*)::int AS count FROM orders WHERE telegram_user_id = $1',
+      [telegramId]
+    );
+    const ordersCount = result.rows[0]?.count || 0;
+    const level = getLoyaltyLevel(ordersCount);
+
+    // Примерные показатели: каждый заказ "Прилавки" в среднем заменяет
+    // ~4 одноразовых упаковки и экономит ~0.5 кг CO₂ по сравнению с обычным супермаркетом.
+    const eco = {
+      packagingSaved: ordersCount * 4,
+      co2SavedKg: Math.round(ordersCount * 0.5 * 10) / 10,
+    };
+
+    res.json({ ordersCount, level, eco });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
 
 // ============================================================
 // Авторизация администратора
