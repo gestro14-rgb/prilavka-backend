@@ -191,11 +191,7 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true });
 });
 
- catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
-  }
-});
+ 
 
 // Весь каталог (категории + товары + отзывы + доставки) — то, что раньше было в products.js
 
