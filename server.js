@@ -288,7 +288,15 @@ app.post('/api/check-zone', async (req, res) => {
         matchedZone = zone;
         break;
       }
+    }    let matchedZone = null;
+    for (const zone of zonesRes.rows) {
+      if (isPointInPolygon(point, zone.coordinates)) {
+        matchedZone = zone;
+        break;
+      }
     }
+  try {
+
   try {
     const result = await query('SELECT * FROM admins WHERE username = $1', [username]);
     const admin = result.rows[0];
