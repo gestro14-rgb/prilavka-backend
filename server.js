@@ -194,6 +194,35 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true });
 });
 
+// ВРЕМЕННЫЙ маршрут: применяет миграцию для таблиц orders (новые поля) и promo_codes.
+// Открыть один раз в браузере после деплоя, затем убрать этот код.
+app.get('/api/migrate-promo', async (req, res) => {
+  try {
+    await query(`
+      CREATE TABLE IF NOT EXISTS promo_codes (
+        id SERIAL PRIMARY KEY,
+        code TEXT UNIQUE NOT NULL,
+        discount_type TEXT NOT NULL DEFAULT 'fixed',
+        discount_value INTEGER NOT NULL,
+        min_order_total INTEGER NOT NULL DEFAULT 0,
+        is_used BOOLEAN NOT NULL DEFAULT false,
+        used_at TIMESTAMPTZ,
+        used_by_telegram_id BIGINT,
+        expires_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS promo_code TEXT`);
+    await query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_amount INTEGER NOT NULL DEFAULT 0`);
+    res.json({ ok: true, message: 'Таблица promo_codes и поля orders готовы' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Весь каталог
+
 // Весь каталог (категории + товары + отзывы + доставки) — то, что раньше было в products.js
 app.get('/api/catalog', async (req, res) => {
   try {
