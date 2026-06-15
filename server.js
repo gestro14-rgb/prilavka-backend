@@ -281,6 +281,52 @@ app.post('/api/check-zone', async (req, res) => {
 // Заказы
 // ============================================================
 
+// Вычисляет размер скидки в рублях для промокода и заданной суммы заказа.
+function computeDiscount(promo, total) {
+  if (promo.discount_type === 'percent') {
+    return Math.floor((total * promo.discount_value) / 100);
+  }
+  return Math.min(promo.discount_value, total);
+}
+
+// Проверяет промокод и возвращает размер скидки, не списывая его.
+// Используется в корзине для предпросмотра скидки до оформления заказа.
+app.post('/api/promo/check', async (req, res) => {
+  const { code, total } = req.body || {};
+  if (!code || !String(code).trim()) {
+    return res.status(400).json({ error: 'Укажите промокод' });
+  }
+  try {
+    const result = await query('SELECT * FROM promo_codes WHERE code = $1', [String(code).trim().toUpperCase()]);
+    const promo = result.rows[0];
+    if (!promo) {
+      return res.json({ valid: false, message: 'Промокод не найден' });
+    }
+    if (promo.is_used) {
+      return res.json({ valid: false, message: 'Промокод уже использован' });
+    }
+    if (promo.expires_at && new Date(promo.expires_at) < new Date()) {
+      return res.json({ valid: false, message: 'Промокод истёк' });
+    }
+    if (promo.min_order_total && total != null && total < promo.min_order_total) {
+      return res.json({
+        valid: false,
+        message: `Промокод действует от ${promo.min_order_total.toLocaleString('ru-RU')} ₽`,
+      });
+    }
+    const discount = computeDiscount(promo, total || 0);
+    res.json({
+      valid: true,
+      discountType: promo.discount_type,
+      discountValue: promo.discount_value,
+      discount,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
 // Создать заказ (из мини-приложения). Сохраняет в базу и присылает уведомление в Telegram.
 app.post('/api/orders', async (req, res) => {
   const {
@@ -293,6 +339,7 @@ app.post('/api/orders', async (req, res) => {
     comment,
     paymentMethod,
     telegramUser,
+    promoCode,
   } = req.body || {};
 
   if (!Array.isArray(items) || items.length === 0 || total == null) {
@@ -300,25 +347,80 @@ app.post('/api/orders', async (req, res) => {
   }
 
   try {
+    // Если указан промокод — проверяем и применяем скидку, и сразу помечаем код использованным.
+    let appliedPromo = null;
+    let discountAmount = 0;
+    let finalTotal = total;
+
+    if (promoCode && String(promoCode).trim()) {
+      const promoRes = await query('SELECT * FROM promo_codes WHERE code = $1', [String(promoCode).trim().toUpperCase()]);
+      const promo = promoRes.rows[0];
+      if (promo && !promo.is_used && (!promo.expires_at || new Date(promo.expires_at) >= new Date())) {
+        if (!promo.min_order_total || total >= promo.min_order_total) {
+          discountAmount = computeDiscount(promo, total);
+          finalTotal = Math.max(0, total - discountAmount);
+          appliedPromo = promo;
+        }
+      }
+    }
+
     const result = await query(
       `INSERT INTO orders
-        (items, total, delivery_date, delivery_slot, address_street, address_details, comment, payment_method, telegram_user_id, telegram_username, telegram_first_name)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        (items, total, delivery_date, delivery_slot, address_street, address_details, comment, payment_method, promo_code, discount_amount, telegram_user_id, telegram_username, telegram_first_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        RETURNING *`,
       [
         JSON.stringify(items),
-        total,
+        finalTotal,
         JSON.stringify(deliveryDate || null),
         deliverySlot || null,
         addressStreet || null,
         addressDetails ? JSON.stringify(addressDetails) : null,
         comment || null,
         paymentMethod === 'cash' ? 'cash' : 'online',
+        appliedPromo ? appliedPromo.code : null,
+        discountAmount,
         telegramUser?.id || null,
         telegramUser?.username || null,
         telegramUser?.firstName || null,
       ]
     );
+
+    const order = result.rows[0];
+
+    // Промокод одноразовый — помечаем использованным сразу после успешного создания заказа.
+    if (appliedPromo) {
+      await query(
+        'UPDATE promo_codes SET is_used = true, used_at = now(), used_by_telegram_id = $1 WHERE id = $2',
+        [telegramUser?.id || null, appliedPromo.id]
+      );
+    }
+
+    // Уведомление в Telegram — не блокирует ответ клиенту, если не настроено или упало
+    const notification = formatOrderNotification({
+      id: order.id,
+      items,
+      total: finalTotal,
+      delivery_date: deliveryDate,
+      delivery_slot: deliverySlot,
+      address_street: addressStreet,
+      address_details: addressDetails,
+      comment,
+      payment_method: order.payment_method,
+      telegram_first_name: order.telegram_first_name,
+      telegram_username: order.telegram_username,
+      promo_code: order.promo_code,
+      discount_amount: order.discount_amount,
+    });
+    sendTelegramMessage(notification);
+
+    res.status(201).json({ id: order.id, status: order.status, total: finalTotal, discount: discountAmount });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
 
     const order = result.rows[0];
 
