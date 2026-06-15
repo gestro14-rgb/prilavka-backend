@@ -191,7 +191,39 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true });
 });
 
+// ВРЕМЕННЫЙ маршрут: применяет миграцию для таблицы orders.
+// Открыть один раз в браузере после деплоя, затем убрать этот код.
+app.get('/api/migrate-orders', async (req, res) => {
+  try {
+    await query(`
+      CREATE TABLE IF NOT EXISTS orders (
+        id SERIAL PRIMARY KEY,
+        items JSONB NOT NULL DEFAULT '[]',
+        total INTEGER NOT NULL,
+        delivery_date JSONB,
+        delivery_slot TEXT,
+        address_street TEXT,
+        address_details JSONB,
+        comment TEXT,
+        payment_method TEXT NOT NULL DEFAULT 'cash',
+        payment_status TEXT NOT NULL DEFAULT 'pending',
+        status TEXT NOT NULL DEFAULT 'new',
+        telegram_user_id BIGINT,
+        telegram_username TEXT,
+        telegram_first_name TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    res.json({ ok: true, message: 'Таблица orders создана (или уже существовала)' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Весь каталог (категории + товары + отзывы + доставки) — то, что раньше было в products.js
+
 app.get('/api/catalog', async (req, res) => {
   try {
     const [categoriesRes, productsRes, reviewsRes, deliveriesRes] = await Promise.all([
