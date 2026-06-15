@@ -12,6 +12,8 @@ app.use(express.json());
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const YANDEX_GEOCODER_API_KEY = process.env.YANDEX_GEOCODER_API_KEY || '';
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID || '';
 
 // ============================================================
 // Вспомогательные функции
@@ -98,6 +100,88 @@ function isPointInPolygon(point, polygon) {
   return inside;
 }
 
+// Отправляет сообщение в Telegram через Bot API.
+// Если TELEGRAM_BOT_TOKEN или TELEGRAM_ADMIN_CHAT_ID не настроены, тихо ничего не делает.
+async function sendTelegramMessage(text) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_ADMIN_CHAT_ID) return;
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_ADMIN_CHAT_ID,
+        text,
+        parse_mode: 'HTML',
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      console.error('Telegram sendMessage failed:', res.status, body);
+    }
+  } catch (e) {
+    console.error('Telegram sendMessage error:', e);
+  }
+}
+
+// Формирует читаемое текстовое сообщение о новом заказе для уведомления в Telegram.
+function formatOrderNotification(order) {
+  const lines = [];
+  lines.push(`🧺 <b>Новый заказ ${'#' + order.id}</b>`);
+  lines.push('');
+
+  if (Array.isArray(order.items)) {
+    for (const item of order.items) {
+      lines.push(`• ${item.title} × ${item.qty} — ${item.sum?.toLocaleString('ru-RU')} ₽`);
+    }
+  }
+  lines.push('');
+  lines.push(`<b>Итого: ${Number(order.total).toLocaleString('ru-RU')} ₽</b>`);
+  lines.push('');
+
+  if (order.delivery_date || order.delivery_slot) {
+    const dateStr = order.delivery_date ? `${order.delivery_date.day || ''} ${order.delivery_date.date || ''}`.trim() : '';
+    lines.push(`📅 ${[dateStr, order.delivery_slot].filter(Boolean).join(', ')}`);
+  }
+
+  if (order.address_street) {
+    lines.push(`📍 ${order.address_street}`);
+  }
+
+  if (order.address_details) {
+    const d = order.address_details;
+    const detailParts = [
+      d.entrance && `подъезд ${d.entrance}`,
+      d.floor && `этаж ${d.floor}`,
+      d.apartment && `кв. ${d.apartment}`,
+      d.intercom && `домофон ${d.intercom}`,
+    ].filter(Boolean);
+    if (detailParts.length > 0) {
+      lines.push(detailParts.join(', '));
+    }
+    if (d.comment) {
+      lines.push(`💬 ${d.comment}`);
+    }
+  }
+
+  if (order.comment) {
+    lines.push(`💬 Комментарий к заказу: ${order.comment}`);
+  }
+
+  lines.push('');
+  const paymentLabel = order.payment_method === 'cash' ? 'При получении (наличные/карта курьеру)' : 'Онлайн';
+  lines.push(`💳 Оплата: ${paymentLabel}`);
+
+  if (order.telegram_first_name || order.telegram_username) {
+    const who = [order.telegram_first_name, order.telegram_username ? `@${order.telegram_username}` : null]
+      .filter(Boolean)
+      .join(' ');
+    lines.push(`👤 ${who}`);
+  }
+
+  return lines.join('\n');
+}
+
 // ============================================================
 // Публичные маршруты (используются мини-приложением)
 // ============================================================
@@ -108,7 +192,6 @@ app.get('/api/health', (req, res) => {
 });
 
 // Весь каталог (категории + товары + отзывы + доставки) — то, что раньше было в products.js
-
 app.get('/api/catalog', async (req, res) => {
   try {
     const [categoriesRes, productsRes, reviewsRes, deliveriesRes] = await Promise.all([
@@ -174,29 +257,6 @@ app.post('/api/check-zone', async (req, res) => {
         break;
       }
     }
-
-    res.json({
-      inZone: Boolean(matchedZone),
-      found: true,
-      address: formattedAddress,
-      zone: matchedZone ? matchedZone.label : null,
-      point,
-    });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message || 'Ошибка сервера' });
-  }
-});
-
-// ============================================================
-// Авторизация администратора
-// ============================================================
-
-app.post('/api/admin/login', async (req, res) => {
-  const { username, password } = req.body || {};
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Укажите логин и пароль' });
-  }
   try {
     const result = await query('SELECT * FROM admins WHERE username = $1', [username]);
     const admin = result.rows[0];
@@ -468,6 +528,58 @@ app.delete('/api/admin/delivery-zones/:id', requireAuth, async (req, res) => {
     const result = await query('DELETE FROM delivery_zones WHERE id = $1', [req.params.id]);
     if (result.rowCount === 0) return res.status(404).json({ error: 'Зона не найдена' });
     res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
+// Админские маршруты — заказы
+// ============================================================
+
+// Список заказов (новые сверху)
+app.get('/api/admin/orders', requireAuth, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM orders ORDER BY created_at DESC LIMIT 200');
+    res.json(
+      result.rows.map((o) => ({
+        id: o.id,
+        items: o.items,
+        total: o.total,
+        deliveryDate: o.delivery_date,
+        deliverySlot: o.delivery_slot,
+        addressStreet: o.address_street,
+        addressDetails: o.address_details,
+        comment: o.comment,
+        paymentMethod: o.payment_method,
+        paymentStatus: o.payment_status,
+        status: o.status,
+        telegramUsername: o.telegram_username,
+        telegramFirstName: o.telegram_first_name,
+        createdAt: o.created_at,
+      }))
+    );
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Обновить статус заказа (например, "в работе", "доставлен", "отменён")
+app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
+  const { status, paymentStatus } = req.body || {};
+  try {
+    const existing = await query('SELECT * FROM orders WHERE id = $1', [req.params.id]);
+    if (!existing.rows[0]) return res.status(404).json({ error: 'Заказ не найден' });
+    const cur = existing.rows[0];
+
+    const result = await query(
+      `UPDATE orders SET status = $1, payment_status = $2, updated_at = now() WHERE id = $3 RETURNING *`,
+      [status ?? cur.status, paymentStatus ?? cur.payment_status, req.params.id]
+    );
+    const o = result.rows[0];
+    res.json({ id: o.id, status: o.status, paymentStatus: o.payment_status });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
