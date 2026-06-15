@@ -79,9 +79,26 @@ CREATE TABLE IF NOT EXISTS orders (
   payment_method TEXT NOT NULL DEFAULT 'cash',
   payment_status TEXT NOT NULL DEFAULT 'pending',
   status TEXT NOT NULL DEFAULT 'new',
+  promo_code TEXT,
+  discount_amount INTEGER NOT NULL DEFAULT 0,
   telegram_user_id BIGINT,
   telegram_username TEXT,
   telegram_first_name TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Промокоды
+-- discount_type: 'fixed' (скидка в рублях) или 'percent' (скидка в процентах)
+CREATE TABLE IF NOT EXISTS promo_codes (
+  id SERIAL PRIMARY KEY,
+  code TEXT UNIQUE NOT NULL,
+  discount_type TEXT NOT NULL DEFAULT 'fixed',
+  discount_value INTEGER NOT NULL,
+  min_order_total INTEGER NOT NULL DEFAULT 0,
+  is_used BOOLEAN NOT NULL DEFAULT false,
+  used_at TIMESTAMPTZ,
+  used_by_telegram_id BIGINT,
+  expires_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
