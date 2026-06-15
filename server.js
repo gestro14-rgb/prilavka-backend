@@ -135,8 +135,11 @@ function formatOrderNotification(order) {
       lines.push(`• ${item.title} × ${item.qty} — ${item.sum?.toLocaleString('ru-RU')} ₽`);
     }
   }
-  lines.push('');
+    lines.push('');
   lines.push(`<b>Итого: ${Number(order.total).toLocaleString('ru-RU')} ₽</b>`);
+  if (order.promo_code && order.discount_amount) {
+    lines.push(`🎁 Промокод ${order.promo_code} (−${Number(order.discount_amount).toLocaleString('ru-RU')} ₽)`);
+  }
   lines.push('');
 
   if (order.delivery_date || order.delivery_slot) {
