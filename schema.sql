@@ -65,3 +65,23 @@ CREATE TABLE IF NOT EXISTS delivery_zones (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Заказы
+CREATE TABLE IF NOT EXISTS orders (
+  id SERIAL PRIMARY KEY,
+  items JSONB NOT NULL DEFAULT '[]',
+  total INTEGER NOT NULL,
+  delivery_date JSONB,
+  delivery_slot TEXT,
+  address_street TEXT,
+  address_details JSONB,
+  comment TEXT,
+  payment_method TEXT NOT NULL DEFAULT 'cash',
+  payment_status TEXT NOT NULL DEFAULT 'pending',
+  status TEXT NOT NULL DEFAULT 'new',
+  telegram_user_id BIGINT,
+  telegram_username TEXT,
+  telegram_first_name TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
