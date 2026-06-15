@@ -819,7 +819,10 @@ app.get('/api/admin/orders', requireAuth, async (req, res) => {
         paymentMethod: o.payment_method,
         paymentStatus: o.payment_status,
         status: o.status,
+        promoCode: o.promo_code,
+        discountAmount: o.discount_amount,
         telegramUsername: o.telegram_username,
+
         telegramFirstName: o.telegram_first_name,
         createdAt: o.created_at,
       }))
@@ -842,8 +845,76 @@ app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
       `UPDATE orders SET status = $1, payment_status = $2, updated_at = now() WHERE id = $3 RETURNING *`,
       [status ?? cur.status, paymentStatus ?? cur.payment_status, req.params.id]
     );
-    const o = result.rows[0];
+        const o = result.rows[0];
     res.json({ id: o.id, status: o.status, paymentStatus: o.payment_status });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
+// Админские маршруты — промокоды
+// ============================================================
+
+function toPromoDTO(row) {
+  return {
+    id: row.id,
+    code: row.code,
+    discountType: row.discount_type,
+    discountValue: row.discount_value,
+    minOrderTotal: row.min_order_total,
+    isUsed: row.is_used,
+    usedAt: row.used_at,
+    expiresAt: row.expires_at,
+    createdAt: row.created_at,
+  };
+}
+
+// Список всех промокодов (новые сверху)
+app.get('/api/admin/promo-codes', requireAuth, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM promo_codes ORDER BY created_at DESC');
+    res.json(result.rows.map(toPromoDTO));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Создать промокод
+app.post('/api/admin/promo-codes', requireAuth, async (req, res) => {
+  const { code, discountType, discountValue, minOrderTotal, expiresAt } = req.body || {};
+  if (!code || !String(code).trim() || !discountValue) {
+    return res.status(400).json({ error: 'Укажите код и размер скидки' });
+  }
+  const type = discountType === 'percent' ? 'percent' : 'fixed';
+  try {
+    const result = await query(
+      `INSERT INTO promo_codes (code, discount_type, discount_value, min_order_total, expires_at)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [
+        String(code).trim().toUpperCase(),
+        type,
+        discountValue,
+        minOrderTotal || 0,
+        expiresAt || null,
+      ]
+    );
+    res.status(201).json(toPromoDTO(result.rows[0]));
+  } catch (e) {
+    console.error(e);
+    if (e.code === '23505') return res.status(409).json({ error: 'Такой промокод уже существует' });
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Удалить промокод
+app.delete('/api/admin/promo-codes/:id', requireAuth, async (req, res) => {
+  try {
+    const result = await query('DELETE FROM promo_codes WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Промокод не найден' });
+    res.json({ ok: true });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
@@ -853,6 +924,7 @@ app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
 // ============================================================
 // Запуск сервера
 // ============================================================
+
 
 app.listen(PORT, () => {
   console.log(`Прилавка API запущен на порту ${PORT}`);
