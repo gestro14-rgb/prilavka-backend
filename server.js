@@ -288,14 +288,97 @@ app.post('/api/check-zone', async (req, res) => {
         matchedZone = zone;
         break;
       }
-    }    let matchedZone = null;
-    for (const zone of zonesRes.rows) {
-      if (isPointInPolygon(point, zone.coordinates)) {
-        matchedZone = zone;
-        break;
-      }
-    }
+    } 
+    res.json({
+      inZone: Boolean(matchedZone),
+      found: true,
+      address: formattedAddress,
+      zone: matchedZone ? matchedZone.label : null,
+      point,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message || 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
+// Заказы
+// ============================================================
+
+// Создать заказ (из мини-приложения). Сохраняет в базу и присылает уведомление в Telegram.
+app.post('/api/orders', async (req, res) => {
+  const {
+    items,
+    total,
+    deliveryDate,
+    deliverySlot,
+    addressStreet,
+    addressDetails,
+    comment,
+    paymentMethod,
+    telegramUser,
+  } = req.body || {};
+
+  if (!Array.isArray(items) || items.length === 0 || total == null) {
+    return res.status(400).json({ error: 'Укажите items и total' });
+  }
+
   try {
+    const result = await query(
+      `INSERT INTO orders
+        (items, total, delivery_date, delivery_slot, address_street, address_details, comment, payment_method, telegram_user_id, telegram_username, telegram_first_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       RETURNING *`,
+      [
+        JSON.stringify(items),
+        total,
+        JSON.stringify(deliveryDate || null),
+        deliverySlot || null,
+        addressStreet || null,
+        addressDetails ? JSON.stringify(addressDetails) : null,
+        comment || null,
+        paymentMethod === 'cash' ? 'cash' : 'online',
+        telegramUser?.id || null,
+        telegramUser?.username || null,
+        telegramUser?.firstName || null,
+      ]
+    );
+
+    const order = result.rows[0];
+
+    // Уведомление в Telegram — не блокирует ответ клиенту, если не настроено или упало
+    const notification = formatOrderNotification({
+      id: order.id,
+      items,
+      total,
+      delivery_date: deliveryDate,
+      delivery_slot: deliverySlot,
+      address_street: addressStreet,
+      address_details: addressDetails,
+      comment,
+      payment_method: order.payment_method,
+      telegram_first_name: order.telegram_first_name,
+      telegram_username: order.telegram_username,
+    });
+    sendTelegramMessage(notification);
+
+    res.status(201).json({ id: order.id, status: order.status });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
+// Авторизация администратора
+// ============================================================
+
+app.post('/api/admin/login', async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Укажите логин и пароль' });
+  }
 
   try {
     const result = await query('SELECT * FROM admins WHERE username = $1', [username]);
