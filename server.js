@@ -15,6 +15,11 @@ const YANDEX_GEOCODER_API_KEY = process.env.YANDEX_GEOCODER_API_KEY || '';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID || '';
 
+const REFERRAL_DISCOUNT = 200;
+const REFERRAL_POINTS_REWARD = 100;
+const REFERRAL_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const REFERRAL_CODE_LENGTH = 6;
+
 // ============================================================
 // Вспомогательные функции
 // ============================================================
@@ -98,6 +103,39 @@ function isPointInPolygon(point, polygon) {
     if (intersects) inside = !inside;
   }
   return inside;
+}
+
+function generateReferralCode() {
+  let code = '';
+  for (let i = 0; i < REFERRAL_CODE_LENGTH; i++) {
+    code += REFERRAL_CODE_CHARS[Math.floor(Math.random() * REFERRAL_CODE_CHARS.length)];
+  }
+  return code;
+}
+
+// Создаёт запись пользователя или обновляет имя при повторном обращении.
+// Генерирует уникальный реферальный код при первом создании.
+async function upsertUser(telegramId, username, firstName) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = generateReferralCode();
+    try {
+      const result = await query(
+        `INSERT INTO users (telegram_id, username, first_name, referral_code)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (telegram_id) DO UPDATE SET
+           username = EXCLUDED.username,
+           first_name = EXCLUDED.first_name,
+           updated_at = now()
+         RETURNING *`,
+        [telegramId, username || null, firstName || null, code]
+      );
+      return result.rows[0];
+    } catch (e) {
+      if (e.code === '23505' && e.detail?.includes('referral_code')) continue;
+      throw e;
+    }
+  }
+  throw new Error('Не удалось сгенерировать уникальный реферальный код');
 }
 
 // Отправляет сообщение в Telegram через Bot API.
@@ -339,18 +377,25 @@ app.post('/api/orders', async (req, res) => {
     paymentMethod,
     telegramUser,
     promoCode,
+    referralCode,
   } = req.body || {};
 
   if (!Array.isArray(items) || items.length === 0 || total == null) {
     return res.status(400).json({ error: 'Укажите items и total' });
   }
 
+  if (promoCode && referralCode) {
+    return res.status(400).json({ error: 'Нельзя использовать промокод и реферальный код одновременно' });
+  }
+
   try {
-    // Если указан промокод — проверяем и применяем скидку, и сразу помечаем код использованным.
     let appliedPromo = null;
+    let appliedReferral = null;
     let discountAmount = 0;
     let finalTotal = total;
+    let appliedReferralCode = null;
 
+    // Применяем промокод (одноразовый, из таблицы promo_codes)
     if (promoCode && String(promoCode).trim()) {
       const promoRes = await query('SELECT * FROM promo_codes WHERE code = $1', [String(promoCode).trim().toUpperCase()]);
       const promo = promoRes.rows[0];
@@ -363,10 +408,39 @@ app.post('/api/orders', async (req, res) => {
       }
     }
 
+    // Применяем реферальный код (только если нет промокода и это первый заказ)
+    if (!appliedPromo && referralCode && String(referralCode).trim()) {
+      appliedReferralCode = String(referralCode).trim().toUpperCase();
+      const referrerRes = await query('SELECT * FROM users WHERE referral_code = $1', [appliedReferralCode]);
+      const referrer = referrerRes.rows[0];
+
+      if (referrer) {
+        const tid = telegramUser?.id;
+
+        // Защита от самореферала
+        if (tid && String(referrer.telegram_id) === String(tid)) {
+          return res.status(400).json({ error: 'Нельзя использовать свой реферальный код' });
+        }
+
+        // Скидка только на первый заказ
+        if (tid) {
+          const prevRes = await query(
+            'SELECT COUNT(*)::int AS count FROM orders WHERE telegram_user_id = $1',
+            [tid]
+          );
+          if ((prevRes.rows[0]?.count || 0) === 0) {
+            discountAmount = REFERRAL_DISCOUNT;
+            finalTotal = Math.max(0, total - discountAmount);
+            appliedReferral = referrer;
+          }
+        }
+      }
+    }
+
     const result = await query(
       `INSERT INTO orders
-        (items, total, delivery_date, delivery_slot, address_street, address_details, comment, payment_method, promo_code, discount_amount, telegram_user_id, telegram_username, telegram_first_name)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        (items, total, delivery_date, delivery_slot, address_street, address_details, comment, payment_method, promo_code, discount_amount, telegram_user_id, telegram_username, telegram_first_name, referral_code)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        RETURNING *`,
       [
         JSON.stringify(items),
@@ -382,6 +456,7 @@ app.post('/api/orders', async (req, res) => {
         telegramUser?.id || null,
         telegramUser?.username || null,
         telegramUser?.firstName || null,
+        appliedReferral ? appliedReferralCode : null,
       ]
     );
 
@@ -392,6 +467,14 @@ app.post('/api/orders', async (req, res) => {
       await query(
         'UPDATE promo_codes SET is_used = true, used_at = now(), used_by_telegram_id = $1 WHERE id = $2',
         [telegramUser?.id || null, appliedPromo.id]
+      );
+    }
+
+    // Записываем, кто пригласил пользователя (только если referred_by_id ещё не стоит).
+    if (appliedReferral && telegramUser?.id) {
+      await query(
+        'UPDATE users SET referred_by_id = $1, updated_at = now() WHERE telegram_id = $2 AND referred_by_id IS NULL',
+        [appliedReferral.telegram_id, telegramUser.id]
       );
     }
 
@@ -451,33 +534,88 @@ function getLoyaltyLevel(ordersCount) {
   };
 }
 
-// Статистика пользователя для программы лояльности: уровень, эко-счётчик.
-// Считается по числу заказов пользователя (telegram_user_id).
+// Статистика пользователя: уровень лояльности, эко-счётчик, реферальный код и баллы.
+// При каждом вызове делает upsert пользователя (создаёт запись и код если нет).
+// Принимает username и firstName как query-параметры для сохранения имени.
 app.get('/api/users/:telegramId/stats', async (req, res) => {
   const telegramId = req.params.telegramId;
+  const { username, firstName } = req.query;
+
   if (!telegramId || telegramId === '0') {
     return res.json({
       ordersCount: 0,
       level: getLoyaltyLevel(0),
       eco: { packagingSaved: 0, co2SavedKg: 0 },
+      referralCode: null,
+      points: 0,
+      referralsCount: 0,
     });
   }
-  try {
-    const result = await query(
-      'SELECT COUNT(*)::int AS count FROM orders WHERE telegram_user_id = $1',
-      [telegramId]
-    );
-    const ordersCount = result.rows[0]?.count || 0;
-    const level = getLoyaltyLevel(ordersCount);
 
-    // Примерные показатели: каждый заказ "Прилавки" в среднем заменяет
-    // ~4 одноразовых упаковки и экономит ~0.5 кг CO₂ по сравнению с обычным супермаркетом.
+  try {
+    const [userRecord, ordersRes] = await Promise.all([
+      upsertUser(telegramId, username, firstName),
+      query('SELECT COUNT(*)::int AS count FROM orders WHERE telegram_user_id = $1', [telegramId]),
+    ]);
+
+    const ordersCount = ordersRes.rows[0]?.count || 0;
+    const level = getLoyaltyLevel(ordersCount);
     const eco = {
       packagingSaved: ordersCount * 4,
       co2SavedKg: Math.round(ordersCount * 0.5 * 10) / 10,
     };
 
-    res.json({ ordersCount, level, eco });
+    const referralsRes = await query(
+      'SELECT COUNT(*)::int AS count FROM users WHERE referred_by_id = $1',
+      [telegramId]
+    );
+
+    res.json({
+      ordersCount,
+      level,
+      eco,
+      referralCode: userRecord.referral_code,
+      points: userRecord.points,
+      referralsCount: referralsRes.rows[0]?.count || 0,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Валидация реферального кода перед оформлением заказа.
+// Проверяет: существование кода, самореферал, первый ли заказ у пользователя.
+app.get('/api/referral/:code', async (req, res) => {
+  const code = req.params.code.trim().toUpperCase();
+  const { telegramId } = req.query;
+
+  try {
+    const referrerRes = await query('SELECT * FROM users WHERE referral_code = $1', [code]);
+    const referrer = referrerRes.rows[0];
+
+    if (!referrer) {
+      return res.json({ valid: false, message: 'Реферальный код не найден' });
+    }
+
+    if (telegramId && String(referrer.telegram_id) === String(telegramId)) {
+      return res.json({ valid: false, message: 'Нельзя использовать свой код' });
+    }
+
+    if (telegramId && telegramId !== '0') {
+      const prevRes = await query(
+        'SELECT COUNT(*)::int AS count FROM orders WHERE telegram_user_id = $1',
+        [telegramId]
+      );
+      if ((prevRes.rows[0]?.count || 0) > 0) {
+        return res.json({ valid: false, message: 'Реферальный код действует только для первого заказа' });
+      }
+    }
+
+    res.json({
+      valid: true,
+      referrerName: referrer.first_name || referrer.username || 'Пользователь',
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
@@ -792,6 +930,7 @@ app.get('/api/admin/orders', requireAuth, async (req, res) => {
         paymentStatus: o.payment_status,
         status: o.status,
         promoCode: o.promo_code,
+        referralCode: o.referral_code,
         discountAmount: o.discount_amount,
         telegramUsername: o.telegram_username,
         telegramFirstName: o.telegram_first_name,
@@ -804,7 +943,8 @@ app.get('/api/admin/orders', requireAuth, async (req, res) => {
   }
 });
 
-// Обновить статус заказа (например, "в работе", "доставлен", "отменён")
+// Обновить статус заказа (например, "в работе", "доставлен", "отменён").
+// При переходе в "delivered" начисляет баллы рефереру (если заказ по реферальному коду).
 app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
   const { status, paymentStatus } = req.body || {};
   try {
@@ -817,6 +957,40 @@ app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
       [status ?? cur.status, paymentStatus ?? cur.payment_status, req.params.id]
     );
     const o = result.rows[0];
+
+    // Начисляем баллы рефереру при переходе в статус "delivered"
+    if (status === 'delivered' && cur.status !== 'delivered' && cur.referral_code) {
+      try {
+        const referrerRes = await query('SELECT telegram_id FROM users WHERE referral_code = $1', [cur.referral_code]);
+        const referrer = referrerRes.rows[0];
+
+        if (referrer) {
+          const alreadyRewarded = await query('SELECT 1 FROM referral_rewards WHERE order_id = $1', [o.id]);
+
+          if (alreadyRewarded.rows.length === 0) {
+            await query(
+              'UPDATE users SET points = points + $1, updated_at = now() WHERE telegram_id = $2',
+              [REFERRAL_POINTS_REWARD, referrer.telegram_id]
+            );
+
+            const referredRes = cur.telegram_user_id
+              ? await query('SELECT telegram_id FROM users WHERE telegram_id = $1', [cur.telegram_user_id])
+              : { rows: [] };
+            const referredId = referredRes.rows[0]?.telegram_id;
+
+            if (referredId) {
+              await query(
+                'INSERT INTO referral_rewards (referrer_id, referred_id, order_id, points_awarded) VALUES ($1,$2,$3,$4)',
+                [referrer.telegram_id, referredId, o.id, REFERRAL_POINTS_REWARD]
+              );
+            }
+          }
+        }
+      } catch (e) {
+        console.error('Ошибка начисления реферальных баллов:', e);
+      }
+    }
+
     res.json({ id: o.id, status: o.status, paymentStatus: o.payment_status });
   } catch (e) {
     console.error(e);
@@ -886,6 +1060,62 @@ app.delete('/api/admin/promo-codes/:id', requireAuth, async (req, res) => {
     const result = await query('DELETE FROM promo_codes WHERE id = $1', [req.params.id]);
     if (result.rowCount === 0) return res.status(404).json({ error: 'Промокод не найден' });
     res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
+// Админские маршруты — пользователи (реферальная программа)
+// ============================================================
+
+// Список всех пользователей с баллами и статистикой рефералов
+app.get('/api/admin/users', requireAuth, async (req, res) => {
+  try {
+    const result = await query(`
+      SELECT
+        u.telegram_id,
+        u.username,
+        u.first_name,
+        u.referral_code,
+        u.points,
+        u.created_at,
+        (SELECT COUNT(*)::int FROM users r WHERE r.referred_by_id = u.telegram_id) AS referrals_count,
+        (SELECT COUNT(*)::int FROM orders o WHERE o.telegram_user_id = u.telegram_id) AS orders_count
+      FROM users u
+      ORDER BY u.created_at DESC
+    `);
+    res.json(result.rows.map((u) => ({
+      telegramId: u.telegram_id,
+      username: u.username,
+      firstName: u.first_name,
+      referralCode: u.referral_code,
+      points: u.points,
+      referralsCount: u.referrals_count,
+      ordersCount: u.orders_count,
+      createdAt: u.created_at,
+    })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Корректировка баллов пользователя (delta может быть отрицательным)
+app.patch('/api/admin/users/:telegramId/points', requireAuth, async (req, res) => {
+  const { delta } = req.body || {};
+  if (delta == null || typeof delta !== 'number' || !Number.isInteger(delta)) {
+    return res.status(400).json({ error: 'Укажите delta (целое число)' });
+  }
+  try {
+    const result = await query(
+      `UPDATE users SET points = GREATEST(0, points + $1), updated_at = now()
+       WHERE telegram_id = $2 RETURNING telegram_id, points`,
+      [delta, req.params.telegramId]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Пользователь не найден' });
+    res.json({ telegramId: result.rows[0].telegram_id, points: result.rows[0].points });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
