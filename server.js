@@ -140,21 +140,19 @@ async function upsertUser(telegramId, username, firstName) {
 
 // Отправляет сообщение в произвольный Telegram-чат через Bot API.
 async function sendTelegramMessageToChat(chatId, text) {
-  console.log('[tg] sendTelegramMessageToChat called, chatId =', chatId, 'hasToken =', !!TELEGRAM_BOT_TOKEN);
-  if (!TELEGRAM_BOT_TOKEN || !chatId) {
-    console.log('[tg] skipped: missing token or chatId');
-    return;
-  }
+  if (!TELEGRAM_BOT_TOKEN || !chatId) return;
   try {
     const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' }),
     });
-    const body = await res.text();
-    console.log('[tg] response status =', res.status, 'body =', body);
+    if (!res.ok) {
+      const body = await res.text();
+      console.error('Telegram sendMessage failed:', res.status, body);
+    }
   } catch (e) {
-    console.error('[tg] fetch error:', e);
+    console.error('Telegram sendMessage error:', e);
   }
 }
 
@@ -239,20 +237,6 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true });
 });
 
-// ВРЕМЕННЫЙ эндпоинт — проставить telegram_user_id для последнего заказа. Удалить после теста.
-app.get('/api/migrate-test-order', async (req, res) => {
-  try {
-    const result = await query(
-      `UPDATE orders SET telegram_user_id = 686803005
-       WHERE id = (SELECT MAX(id) FROM orders)
-       RETURNING id, telegram_user_id`,
-    );
-    if (!result.rows[0]) return res.status(404).json({ error: 'Заказов нет' });
-    res.json({ ok: true, orderId: result.rows[0].id, telegramUserId: result.rows[0].telegram_user_id });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
 
 // Весь каталог
 
@@ -1015,12 +999,8 @@ app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
     }
 
     // Уведомляем пользователя о смене статуса (fire-and-forget)
-    console.log('[order] id =', o.id, 'old status =', cur.status, 'new status =', status, 'telegram_user_id =', o.telegram_user_id);
     if (status && status !== cur.status && o.telegram_user_id && ORDER_STATUS_NOTIFICATIONS[status]) {
-      console.log('[order] sending user notification for status =', status);
       sendTelegramMessageToChat(o.telegram_user_id, ORDER_STATUS_NOTIFICATIONS[status](o.id));
-    } else {
-      console.log('[order] notification skipped: status changed =', status !== cur.status, 'has user_id =', !!o.telegram_user_id, 'has template =', !!ORDER_STATUS_NOTIFICATIONS[status]);
     }
 
     res.json({ id: o.id, status: o.status, paymentStatus: o.payment_status });
