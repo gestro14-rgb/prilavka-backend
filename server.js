@@ -239,6 +239,21 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true });
 });
 
+// ВРЕМЕННЫЙ эндпоинт — проставить telegram_user_id для последнего заказа. Удалить после теста.
+app.get('/api/migrate-test-order', async (req, res) => {
+  try {
+    const result = await query(
+      `UPDATE orders SET telegram_user_id = 686803005
+       WHERE id = (SELECT MAX(id) FROM orders)
+       RETURNING id, telegram_user_id`,
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Заказов нет' });
+    res.json({ ok: true, orderId: result.rows[0].id, telegramUserId: result.rows[0].telegram_user_id });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // Весь каталог
 
 // Весь каталог (категории + товары + отзывы + доставки) — то, что раньше было в products.js
