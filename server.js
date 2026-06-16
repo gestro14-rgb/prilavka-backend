@@ -615,6 +615,7 @@ app.get('/api/referral/:code', async (req, res) => {
     res.json({
       valid: true,
       referrerName: referrer.first_name || referrer.username || 'Пользователь',
+      discount: REFERRAL_DISCOUNT,
     });
   } catch (e) {
     console.error(e);
