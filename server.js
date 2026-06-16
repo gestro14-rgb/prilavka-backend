@@ -386,8 +386,6 @@ app.post('/api/orders', async (req, res) => {
     referralCode,
   } = req.body || {};
 
-  console.log('[order] telegramUser from req.body:', JSON.stringify(telegramUser));
-
   if (!Array.isArray(items) || items.length === 0 || total == null) {
     return res.status(400).json({ error: 'Укажите items и total' });
   }
