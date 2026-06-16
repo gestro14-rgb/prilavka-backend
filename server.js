@@ -1026,6 +1026,21 @@ app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
       }
     }
 
+    // Начисляем баллы покупателю за доставленный заказ (5% от суммы, округление вниз)
+    if (status === 'delivered' && cur.status !== 'delivered' && o.telegram_user_id) {
+      const pointsToAward = Math.floor(Number(o.total) * 0.05);
+      if (pointsToAward > 0) {
+        try {
+          await query(
+            'UPDATE users SET points = points + $1, updated_at = now() WHERE telegram_id = $2',
+            [pointsToAward, o.telegram_user_id]
+          );
+        } catch (e) {
+          console.error('Ошибка начисления баллов за заказ:', e);
+        }
+      }
+    }
+
     // Уведомляем пользователя о смене статуса (fire-and-forget)
     if (status && status !== cur.status && o.telegram_user_id && ORDER_STATUS_NOTIFICATIONS[status]) {
       sendTelegramMessageToChat(o.telegram_user_id, ORDER_STATUS_NOTIFICATIONS[status](o.id));
