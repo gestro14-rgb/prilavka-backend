@@ -590,6 +590,34 @@ app.get('/api/users/:telegramId/stats', async (req, res) => {
   }
 });
 
+// Последние 10 заказов пользователя по telegram_user_id — для истории в профиле.
+app.get('/api/users/:telegramId/orders', async (req, res) => {
+  const { telegramId } = req.params;
+  if (!telegramId || telegramId === '0') return res.json([]);
+  try {
+    const result = await query(
+      `SELECT id, total, status, created_at, items, delivery_date, delivery_slot
+       FROM orders
+       WHERE telegram_user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 10`,
+      [telegramId]
+    );
+    res.json(result.rows.map((o) => ({
+      id: o.id,
+      total: o.total,
+      status: o.status,
+      createdAt: o.created_at,
+      items: o.items,
+      deliveryDate: o.delivery_date,
+      deliverySlot: o.delivery_slot,
+    })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
 // Валидация реферального кода перед оформлением заказа.
 // Проверяет: существование кода, самореферал, первый ли заказ у пользователя.
 app.get('/api/referral/:code', async (req, res) => {
