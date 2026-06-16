@@ -140,19 +140,21 @@ async function upsertUser(telegramId, username, firstName) {
 
 // Отправляет сообщение в произвольный Telegram-чат через Bot API.
 async function sendTelegramMessageToChat(chatId, text) {
-  if (!TELEGRAM_BOT_TOKEN || !chatId) return;
+  console.log('[tg] sendTelegramMessageToChat called, chatId =', chatId, 'hasToken =', !!TELEGRAM_BOT_TOKEN);
+  if (!TELEGRAM_BOT_TOKEN || !chatId) {
+    console.log('[tg] skipped: missing token or chatId');
+    return;
+  }
   try {
     const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' }),
     });
-    if (!res.ok) {
-      const body = await res.text();
-      console.error('Telegram sendMessage failed:', res.status, body);
-    }
+    const body = await res.text();
+    console.log('[tg] response status =', res.status, 'body =', body);
   } catch (e) {
-    console.error('Telegram sendMessage error:', e);
+    console.error('[tg] fetch error:', e);
   }
 }
 
@@ -998,8 +1000,12 @@ app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
     }
 
     // Уведомляем пользователя о смене статуса (fire-and-forget)
+    console.log('[order] id =', o.id, 'old status =', cur.status, 'new status =', status, 'telegram_user_id =', o.telegram_user_id);
     if (status && status !== cur.status && o.telegram_user_id && ORDER_STATUS_NOTIFICATIONS[status]) {
+      console.log('[order] sending user notification for status =', status);
       sendTelegramMessageToChat(o.telegram_user_id, ORDER_STATUS_NOTIFICATIONS[status](o.id));
+    } else {
+      console.log('[order] notification skipped: status changed =', status !== cur.status, 'has user_id =', !!o.telegram_user_id, 'has template =', !!ORDER_STATUS_NOTIFICATIONS[status]);
     }
 
     res.json({ id: o.id, status: o.status, paymentStatus: o.payment_status });
