@@ -3,12 +3,7 @@ import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import 'dotenv/config';
-import { readFileSync } from 'fs';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
 import { pool, query } from './db.js';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const app = express();
 app.use(cors());
@@ -235,22 +230,6 @@ function formatOrderNotification(order) {
 // Healthcheck
 app.get('/api/health', (req, res) => {
   res.json({ ok: true });
-});
-
-// ВРЕМЕННЫЙ эндпоинт — применяет миграцию реферальной программы.
-// Удалить после применения на production.
-app.get('/api/migrate-referral', async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const sql = readFileSync(join(__dirname, 'migrations', '001_referral_program.sql'), 'utf8');
-    await client.query(sql);
-    res.json({ ok: true, message: 'Миграция 001_referral_program применена' });
-  } catch (e) {
-    console.error('Migration error:', e);
-    res.status(500).json({ ok: false, error: e.message });
-  } finally {
-    client.release();
-  }
 });
 
 // Весь каталог
