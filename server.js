@@ -1163,6 +1163,110 @@ app.patch('/api/admin/users/:telegramId/points', requireAuth, async (req, res) =
 });
 
 // ============================================================
+// Награды
+// ============================================================
+
+// Активные награды для мини-приложения
+app.get('/api/rewards', async (req, res) => {
+  try {
+    const result = await query(
+      'SELECT id, title, description, emoji, points_cost FROM rewards WHERE is_active = true ORDER BY points_cost ASC'
+    );
+    res.json(result.rows.map((r) => ({
+      id: r.id, title: r.title, description: r.description,
+      emoji: r.emoji, pointsCost: r.points_cost,
+    })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Все награды для админки
+app.get('/api/admin/rewards', requireAuth, async (req, res) => {
+  try {
+    const result = await query(
+      'SELECT id, title, description, emoji, points_cost, is_active, created_at FROM rewards ORDER BY created_at DESC'
+    );
+    res.json(result.rows.map((r) => ({
+      id: r.id, title: r.title, description: r.description,
+      emoji: r.emoji, pointsCost: r.points_cost,
+      isActive: r.is_active, createdAt: r.created_at,
+    })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Создать награду
+app.post('/api/admin/rewards', requireAuth, async (req, res) => {
+  const { title, description, emoji, pointsCost, isActive } = req.body || {};
+  if (!title || !pointsCost || typeof pointsCost !== 'number' || pointsCost <= 0) {
+    return res.status(400).json({ error: 'Укажите title и pointsCost (> 0)' });
+  }
+  try {
+    const result = await query(
+      `INSERT INTO rewards (title, description, emoji, points_cost, is_active)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, title, description, emoji, points_cost, is_active, created_at`,
+      [title, description || null, emoji || null, pointsCost, isActive !== false]
+    );
+    const r = result.rows[0];
+    res.status(201).json({
+      id: r.id, title: r.title, description: r.description,
+      emoji: r.emoji, pointsCost: r.points_cost,
+      isActive: r.is_active, createdAt: r.created_at,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Обновить награду (в т.ч. переключить is_active)
+app.patch('/api/admin/rewards/:id', requireAuth, async (req, res) => {
+  const { title, description, emoji, pointsCost, isActive } = req.body || {};
+  const fields = [];
+  const vals = [];
+  let i = 1;
+  if (title !== undefined)      { fields.push(`title = $${i++}`);       vals.push(title); }
+  if (description !== undefined){ fields.push(`description = $${i++}`); vals.push(description); }
+  if (emoji !== undefined)      { fields.push(`emoji = $${i++}`);       vals.push(emoji); }
+  if (pointsCost !== undefined) { fields.push(`points_cost = $${i++}`); vals.push(pointsCost); }
+  if (isActive !== undefined)   { fields.push(`is_active = $${i++}`);   vals.push(isActive); }
+  if (fields.length === 0) return res.status(400).json({ error: 'Нет полей для обновления' });
+  vals.push(req.params.id);
+  try {
+    const result = await query(
+      `UPDATE rewards SET ${fields.join(', ')} WHERE id = $${i} RETURNING id, title, description, emoji, points_cost, is_active`,
+      vals
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Награда не найдена' });
+    const r = result.rows[0];
+    res.json({
+      id: r.id, title: r.title, description: r.description,
+      emoji: r.emoji, pointsCost: r.points_cost, isActive: r.is_active,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Удалить награду
+app.delete('/api/admin/rewards/:id', requireAuth, async (req, res) => {
+  try {
+    const result = await query('DELETE FROM rewards WHERE id = $1 RETURNING id', [req.params.id]);
+    if (!result.rows[0]) return res.status(404).json({ error: 'Награда не найдена' });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
 // Запуск сервера
 // ============================================================
 
