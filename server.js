@@ -17,6 +17,7 @@ const TELEGRAM_ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID || '';
 
 const REFERRAL_DISCOUNT = 200;
 const REFERRAL_POINTS_REWARD = 100;
+const POINTS_PERCENT = 0.05;
 const REFERRAL_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const REFERRAL_CODE_LENGTH = 6;
 
@@ -1028,7 +1029,7 @@ app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
 
     // Начисляем баллы покупателю за доставленный заказ (5% от суммы, округление вниз)
     if (status === 'delivered' && cur.status !== 'delivered' && o.telegram_user_id) {
-      const pointsToAward = Math.floor(Number(o.total) * 0.05);
+      const pointsToAward = Math.floor(Number(o.total) * POINTS_PERCENT);
       if (pointsToAward > 0) {
         try {
           await query(
