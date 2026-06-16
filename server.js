@@ -3,12 +3,7 @@ import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import 'dotenv/config';
-import { readFileSync } from 'fs';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
 import { pool, query } from './db.js';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const app = express();
 app.use(cors());
@@ -1268,18 +1263,6 @@ app.delete('/api/admin/rewards/:id', requireAuth, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
-  }
-});
-
-// ВРЕМЕННЫЙ эндпоинт — удалить после применения миграции
-app.get('/api/migrate-rewards', async (req, res) => {
-  try {
-    const sql = readFileSync(join(__dirname, 'migrations', '002_rewards.sql'), 'utf8');
-    await pool.query(sql);
-    res.json({ ok: true, message: 'Миграция 002_rewards применена' });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
   }
 });
 
