@@ -461,13 +461,32 @@ app.post('/api/orders', async (req, res) => {
       }
     }
 
+    // Проверяем pending-награду и добавляем в состав заказа как бесплатный товар
+    let pendingReward = null;
+    try {
+      const prRes = await query(
+        `SELECT ur.id AS user_reward_id, r.title, r.emoji
+         FROM user_rewards ur
+         JOIN rewards r ON ur.reward_id = r.id
+         WHERE ur.telegram_id = $1 AND ur.status = 'pending'
+         LIMIT 1`,
+        [telegramUser?.id || 0]
+      );
+      pendingReward = prRes.rows[0] || null;
+    } catch (e) {
+      // Таблица user_rewards может не существовать до миграции — не блокируем заказ
+    }
+    const orderItems = pendingReward
+      ? [...items, { title: pendingReward.title, emoji: pendingReward.emoji || '🎁', qty: 1, sum: 0, isReward: true }]
+      : items;
+
     const result = await query(
       `INSERT INTO orders
         (items, total, delivery_date, delivery_slot, address_street, address_details, comment, payment_method, promo_code, discount_amount, telegram_user_id, telegram_username, telegram_first_name, referral_code)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        RETURNING *`,
       [
-        JSON.stringify(items),
+        JSON.stringify(orderItems),
         finalTotal,
         JSON.stringify(deliveryDate || null),
         deliverySlot || null,
@@ -500,6 +519,15 @@ app.post('/api/orders', async (req, res) => {
         'UPDATE users SET points = GREATEST(0, points - $1), updated_at = now() WHERE telegram_id = $2',
         [pointsSpent, telegramUser.id]
       );
+    }
+
+    // Помечаем pending-награду как использованную
+    if (pendingReward && telegramUser?.id) {
+      try {
+        await query("UPDATE user_rewards SET status = 'used' WHERE id = $1", [pendingReward.user_reward_id]);
+      } catch (e) {
+        console.error('Ошибка пометки награды:', e);
+      }
     }
 
     // Записываем, кто пригласил пользователя (только если referred_by_id ещё не стоит).
@@ -654,6 +682,104 @@ app.get('/api/users/:telegramId/balance', async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Pending-награда пользователя (если есть) — для корзины и профиля.
+app.get('/api/users/:telegramId/pending-reward', async (req, res) => {
+  const { telegramId } = req.params;
+  if (!telegramId || telegramId === '0') return res.json(null);
+  try {
+    const result = await query(
+      `SELECT ur.id AS user_reward_id, ur.reward_id, r.title, r.emoji, r.description
+       FROM user_rewards ur
+       JOIN rewards r ON ur.reward_id = r.id
+       WHERE ur.telegram_id = $1 AND ur.status = 'pending'
+       LIMIT 1`,
+      [telegramId]
+    );
+    res.json(result.rows[0] || null);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Обменять баллы на награду (транзакция: проверить баланс → списать → создать user_rewards).
+app.post('/api/users/:telegramId/redeem-reward', async (req, res) => {
+  const { telegramId } = req.params;
+  const { rewardId } = req.body || {};
+  if (!telegramId || telegramId === '0') return res.status(400).json({ error: 'Требуется авторизация' });
+  if (!rewardId) return res.status(400).json({ error: 'Укажите rewardId' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const rewardRes = await client.query('SELECT * FROM rewards WHERE id = $1 AND is_active = true', [rewardId]);
+    const reward = rewardRes.rows[0];
+    if (!reward) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Награда не найдена или недоступна' });
+    }
+
+    const pendingRes = await client.query(
+      "SELECT id FROM user_rewards WHERE telegram_id = $1 AND status = 'pending'",
+      [telegramId]
+    );
+    if (pendingRes.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'У вас уже есть активная награда — добавьте заказ, чтобы получить её' });
+    }
+
+    const userRes = await client.query('SELECT points FROM users WHERE telegram_id = $1', [telegramId]);
+    const userRow = userRes.rows[0];
+    if (!userRow) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+    if (userRow.points < reward.points_cost) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Недостаточно баллов' });
+    }
+
+    await client.query(
+      'UPDATE users SET points = points - $1, updated_at = now() WHERE telegram_id = $2',
+      [reward.points_cost, telegramId]
+    );
+
+    await client.query(
+      "INSERT INTO user_rewards (telegram_id, reward_id, status) VALUES ($1, $2, 'pending')",
+      [telegramId, rewardId]
+    );
+
+    await client.query('COMMIT');
+    res.json({ ok: true, pointsLeft: userRow.points - reward.points_cost });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  } finally {
+    client.release();
+  }
+});
+
+// ВРЕМЕННЫЙ эндпоинт — удалить после применения миграции
+app.get('/api/migrate-user-rewards', async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_rewards (
+        id          SERIAL       PRIMARY KEY,
+        telegram_id BIGINT       NOT NULL REFERENCES users(telegram_id),
+        reward_id   INTEGER      NOT NULL REFERENCES rewards(id),
+        status      TEXT         NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'used')),
+        created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+      );
+    `);
+    res.json({ ok: true, message: 'Миграция 003_user_rewards применена' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
   }
 });
 
