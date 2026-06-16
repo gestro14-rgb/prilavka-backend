@@ -138,20 +138,14 @@ async function upsertUser(telegramId, username, firstName) {
   throw new Error('Не удалось сгенерировать уникальный реферальный код');
 }
 
-// Отправляет сообщение в Telegram через Bot API.
-// Если TELEGRAM_BOT_TOKEN или TELEGRAM_ADMIN_CHAT_ID не настроены, тихо ничего не делает.
-async function sendTelegramMessage(text) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_ADMIN_CHAT_ID) return;
+// Отправляет сообщение в произвольный Telegram-чат через Bot API.
+async function sendTelegramMessageToChat(chatId, text) {
+  if (!TELEGRAM_BOT_TOKEN || !chatId) return;
   try {
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    const res = await fetch(url, {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_ADMIN_CHAT_ID,
-        text,
-        parse_mode: 'HTML',
-      }),
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' }),
     });
     if (!res.ok) {
       const body = await res.text();
@@ -161,6 +155,17 @@ async function sendTelegramMessage(text) {
     console.error('Telegram sendMessage error:', e);
   }
 }
+
+// Отправляет уведомление администратору (в TELEGRAM_ADMIN_CHAT_ID).
+function sendTelegramMessage(text) {
+  return sendTelegramMessageToChat(TELEGRAM_ADMIN_CHAT_ID, text);
+}
+
+const ORDER_STATUS_NOTIFICATIONS = {
+  in_progress: (id) => `🥗 Ваш заказ #${id} готовится!`,
+  delivered:   (id) => `✅ Заказ #${id} доставлен. Спасибо!`,
+  cancelled:   (id) => `❌ Заказ #${id} отменён. Свяжитесь с нами если вопросы.`,
+};
 
 // Формирует читаемое текстовое сообщение о новом заказе для уведомления в Telegram.
 function formatOrderNotification(order) {
@@ -990,6 +995,11 @@ app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
       } catch (e) {
         console.error('Ошибка начисления реферальных баллов:', e);
       }
+    }
+
+    // Уведомляем пользователя о смене статуса (fire-and-forget)
+    if (status && status !== cur.status && o.telegram_user_id && ORDER_STATUS_NOTIFICATIONS[status]) {
+      sendTelegramMessageToChat(o.telegram_user_id, ORDER_STATUS_NOTIFICATIONS[status](o.id));
     }
 
     res.json({ id: o.id, status: o.status, paymentStatus: o.payment_status });
