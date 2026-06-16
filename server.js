@@ -385,6 +385,7 @@ app.post('/api/orders', async (req, res) => {
     telegramUser,
     promoCode,
     referralCode,
+    pointsToSpend,
   } = req.body || {};
 
   if (!Array.isArray(items) || items.length === 0 || total == null) {
@@ -444,6 +445,22 @@ app.post('/api/orders', async (req, res) => {
       }
     }
 
+    // Применяем баллы (только если нет промокода и есть авторизованный пользователь)
+    let pointsSpent = 0;
+    if (!appliedPromo && !appliedReferral && pointsToSpend > 0 && telegramUser?.id) {
+      const maxByPercent = Math.floor(total * 0.30);
+      const allowed = Math.min(pointsToSpend, maxByPercent);
+      if (allowed > 0) {
+        const balanceRes = await query('SELECT points FROM users WHERE telegram_id = $1', [telegramUser.id]);
+        const balance = balanceRes.rows[0]?.points ?? 0;
+        pointsSpent = Math.min(allowed, balance);
+        if (pointsSpent > 0) {
+          discountAmount += pointsSpent;
+          finalTotal = Math.max(0, finalTotal - pointsSpent);
+        }
+      }
+    }
+
     const result = await query(
       `INSERT INTO orders
         (items, total, delivery_date, delivery_slot, address_street, address_details, comment, payment_method, promo_code, discount_amount, telegram_user_id, telegram_username, telegram_first_name, referral_code)
@@ -477,6 +494,14 @@ app.post('/api/orders', async (req, res) => {
       );
     }
 
+    // Списываем баллы после успешного создания заказа
+    if (pointsSpent > 0 && telegramUser?.id) {
+      await query(
+        'UPDATE users SET points = GREATEST(0, points - $1), updated_at = now() WHERE telegram_id = $2',
+        [pointsSpent, telegramUser.id]
+      );
+    }
+
     // Записываем, кто пригласил пользователя (только если referred_by_id ещё не стоит).
     if (appliedReferral && telegramUser?.id) {
       await query(
@@ -503,7 +528,7 @@ app.post('/api/orders', async (req, res) => {
     });
     sendTelegramMessage(notification);
 
-    res.status(201).json({ id: order.id, status: order.status, total: finalTotal, discount: discountAmount });
+    res.status(201).json({ id: order.id, status: order.status, total: finalTotal, discount: discountAmount, pointsSpent });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
@@ -613,6 +638,19 @@ app.get('/api/users/:telegramId/orders', async (req, res) => {
       deliveryDate: o.delivery_date,
       deliverySlot: o.delivery_slot,
     })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Текущий баланс баллов пользователя — лёгкий эндпоинт для корзины.
+app.get('/api/users/:telegramId/balance', async (req, res) => {
+  const { telegramId } = req.params;
+  if (!telegramId || telegramId === '0') return res.json({ points: 0 });
+  try {
+    const result = await query('SELECT points FROM users WHERE telegram_id = $1', [telegramId]);
+    res.json({ points: result.rows[0]?.points ?? 0 });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
