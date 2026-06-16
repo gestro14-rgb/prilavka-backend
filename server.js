@@ -764,25 +764,6 @@ app.post('/api/users/:telegramId/redeem-reward', async (req, res) => {
   }
 });
 
-// ВРЕМЕННЫЙ эндпоинт — удалить после применения миграции
-app.get('/api/migrate-user-rewards', async (req, res) => {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS user_rewards (
-        id          SERIAL       PRIMARY KEY,
-        telegram_id BIGINT       NOT NULL REFERENCES users(telegram_id),
-        reward_id   INTEGER      NOT NULL REFERENCES rewards(id),
-        status      TEXT         NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'used')),
-        created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
-      );
-    `);
-    res.json({ ok: true, message: 'Миграция 003_user_rewards применена' });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
 // Валидация реферального кода перед оформлением заказа.
 // Проверяет: существование кода, самореферал, первый ли заказ у пользователя.
 app.get('/api/referral/:code', async (req, res) => {
