@@ -1802,7 +1802,7 @@ app.delete('/api/admin/delivery-schedule/:id', requireAuth, async (req, res) => 
 // Временный эндпоинт — миграция 007 (удалить после применения)
 // ============================================================
 
-app.post('/api/admin/run-migration-007', requireAuth, async (req, res) => {
+app.get('/api/migrate-schedule', async (req, res) => {
   try {
     await query(`
       CREATE TABLE IF NOT EXISTS delivery_schedule (
