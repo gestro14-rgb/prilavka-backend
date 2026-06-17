@@ -1277,6 +1277,108 @@ app.delete('/api/admin/promo-codes/:id', requireAuth, async (req, res) => {
 });
 
 // ============================================================
+// Админские маршруты — отзывы
+// ============================================================
+
+app.get('/api/admin/reviews', requireAuth, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM reviews ORDER BY sort_order ASC, id ASC');
+    res.json(result.rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      area: r.area,
+      stars: r.stars,
+      text: r.text,
+      emoji: r.emoji,
+      sortOrder: r.sort_order,
+    })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.post('/api/admin/reviews', requireAuth, async (req, res) => {
+  const { name, area, stars, text, emoji, sortOrder } = req.body || {};
+  if (!name || !area || !text || !emoji) {
+    return res.status(400).json({ error: 'Обязательные поля: name, area, text, emoji' });
+  }
+  try {
+    const result = await query(
+      `INSERT INTO reviews (name, area, stars, text, emoji, sort_order)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [name, area, Number(stars) || 5, text, emoji, Number(sortOrder) || 0]
+    );
+    const r = result.rows[0];
+    res.status(201).json({ id: r.id, name: r.name, area: r.area, stars: r.stars, text: r.text, emoji: r.emoji, sortOrder: r.sort_order });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.delete('/api/admin/reviews/:id', requireAuth, async (req, res) => {
+  try {
+    const result = await query('DELETE FROM reviews WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Отзыв не найден' });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
+// Админские маршруты — последние доставки
+// ============================================================
+
+app.get('/api/admin/deliveries', requireAuth, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM deliveries ORDER BY sort_order ASC, id ASC');
+    res.json(result.rows.map((d) => ({
+      id: d.id,
+      emoji: d.emoji,
+      title: d.title,
+      text: d.text,
+      sortOrder: d.sort_order,
+    })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.post('/api/admin/deliveries', requireAuth, async (req, res) => {
+  const { emoji, title, text, sortOrder } = req.body || {};
+  if (!emoji || !title || !text) {
+    return res.status(400).json({ error: 'Обязательные поля: emoji, title, text' });
+  }
+  try {
+    const result = await query(
+      `INSERT INTO deliveries (emoji, title, text, sort_order)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [emoji, title, text, Number(sortOrder) || 0]
+    );
+    const d = result.rows[0];
+    res.status(201).json({ id: d.id, emoji: d.emoji, title: d.title, text: d.text, sortOrder: d.sort_order });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.delete('/api/admin/deliveries/:id', requireAuth, async (req, res) => {
+  try {
+    const result = await query('DELETE FROM deliveries WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Запись не найдена' });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
 // Админские маршруты — пользователи (реферальная программа)
 // ============================================================
 
