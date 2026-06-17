@@ -23,6 +23,9 @@ const REFERRAL_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const REFERRAL_CODE_LENGTH = 6;
 const MIN_ORDER_TOTAL = 1990;
 
+// Состояние диалога отзыва с ботом: telegramId (string) → { step, rating, text, firstName }
+const reviewDialogs = new Map();
+
 // ============================================================
 // Вспомогательные функции
 // ============================================================
@@ -1279,6 +1282,13 @@ app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
       sendTelegramMessageToChat(o.telegram_user_id, ORDER_STATUS_NOTIFICATIONS[status](o.id));
     }
 
+    // Приглашение оставить отзыв при переходе в "delivered" (fire-and-forget)
+    if (status === 'delivered' && cur.status !== 'delivered' && o.telegram_user_id) {
+      sendReviewInvite(o.telegram_user_id, o.telegram_first_name).catch((e) =>
+        console.error('sendReviewInvite error:', e)
+      );
+    }
+
     res.json({ id: o.id, status: o.status, paymentStatus: o.payment_status });
   } catch (e) {
     console.error(e);
@@ -1822,9 +1832,175 @@ app.delete('/api/admin/delivery-schedule/:id', requireAuth, async (req, res) => 
 });
 
 // ============================================================
+// Telegram-бот: сбор отзывов через long polling
+// ============================================================
+
+// Универсальный вызов Bot API. Возвращает result или null при ошибке.
+async function botRequest(method, body) {
+  if (!TELEGRAM_BOT_TOKEN) return null;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    return data.ok ? data.result : null;
+  } catch (e) {
+    console.error(`botRequest ${method} error:`, e);
+    return null;
+  }
+}
+
+// Отправляет приглашение с inline-кнопками оценки.
+// Не отправляет если пользователь уже оставлял отзыв или диалог уже открыт.
+async function sendReviewInvite(telegramId, firstName) {
+  const uid = String(telegramId);
+  if (reviewDialogs.has(uid)) return;
+  const existing = await query('SELECT 1 FROM reviews WHERE telegram_user_id = $1 LIMIT 1', [telegramId]);
+  if (existing.rows.length > 0) return;
+
+  await botRequest('sendMessage', {
+    chat_id: telegramId,
+    text: '🙏 Спасибо за заказ! Как вам доставка?',
+    reply_markup: {
+      inline_keyboard: [[
+        { text: '⭐ 1',     callback_data: 'review_rating:1' },
+        { text: '⭐⭐ 2',   callback_data: 'review_rating:2' },
+        { text: '⭐⭐⭐ 3', callback_data: 'review_rating:3' },
+        { text: '⭐⭐⭐⭐ 4',   callback_data: 'review_rating:4' },
+        { text: '⭐⭐⭐⭐⭐ 5', callback_data: 'review_rating:5' },
+      ]],
+    },
+  });
+
+  reviewDialogs.set(uid, { step: 'rating', rating: null, text: null, firstName: firstName || 'Клиент' });
+}
+
+// Сохраняет отзыв в БД и благодарит пользователя.
+async function saveReview(uid, dialog, imageUrl) {
+  const emoji = REVIEW_EMOJIS[Math.floor(Math.random() * REVIEW_EMOJIS.length)];
+  await query(
+    `INSERT INTO reviews (name, area, stars, text, emoji, status, telegram_user_id, image_url)
+     VALUES ($1, 'Москва', $2, $3, $4, 'pending', $5, $6)`,
+    [
+      (dialog.firstName || 'Клиент').trim(),
+      dialog.rating || 5,
+      dialog.text || '—',
+      emoji,
+      uid,
+      imageUrl || null,
+    ]
+  );
+  await botRequest('sendMessage', {
+    chat_id: uid,
+    text: '🙏 Спасибо за отзыв! Он появится после проверки.',
+  });
+}
+
+// Обрабатывает одно входящее обновление от Telegram.
+async function handleBotUpdate(update) {
+  // Нажатие inline-кнопки оценки
+  if (update.callback_query) {
+    const cq = update.callback_query;
+    const uid = String(cq.from.id);
+    await botRequest('answerCallbackQuery', { callback_query_id: cq.id });
+
+    if (!cq.data?.startsWith('review_rating:')) return;
+    const dialog = reviewDialogs.get(uid);
+    if (!dialog || dialog.step !== 'rating') return;
+
+    const rating = parseInt(cq.data.split(':')[1], 10);
+    dialog.rating = rating;
+    dialog.step = 'text';
+    reviewDialogs.set(uid, dialog);
+
+    await botRequest('editMessageText', {
+      chat_id: cq.message.chat.id,
+      message_id: cq.message.message_id,
+      text: `Ваша оценка: ${'⭐'.repeat(rating)}`,
+    });
+    await botRequest('sendMessage', {
+      chat_id: uid,
+      text: 'Напишите пару слов о заказе, или /skip чтобы пропустить.',
+    });
+    return;
+  }
+
+  // Текстовое сообщение или фото
+  if (update.message) {
+    const msg = update.message;
+    const uid = String(msg.from?.id ?? msg.chat.id);
+    const dialog = reviewDialogs.get(uid);
+    if (!dialog) return;
+
+    if (dialog.step === 'text') {
+      const raw = (msg.text || '').trim();
+      dialog.text = raw === '/skip' ? null : raw || null;
+      dialog.step = 'photo';
+      reviewDialogs.set(uid, dialog);
+      await botRequest('sendMessage', {
+        chat_id: uid,
+        text: 'Пришлите фото заказа, или /skip чтобы завершить без фото.',
+      });
+      return;
+    }
+
+    if (dialog.step === 'photo') {
+      if (msg.photo?.length > 0) {
+        // Берём версию с наибольшим разрешением (последний элемент)
+        const fileId = msg.photo[msg.photo.length - 1].file_id;
+        const fileInfo = await botRequest('getFile', { file_id: fileId });
+        const imageUrl = fileInfo?.file_path
+          ? `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`
+          : null;
+        reviewDialogs.delete(uid);
+        await saveReview(uid, dialog, imageUrl);
+      } else if ((msg.text || '').trim() === '/skip') {
+        reviewDialogs.delete(uid);
+        await saveReview(uid, dialog, null);
+      } else {
+        await botRequest('sendMessage', {
+          chat_id: uid,
+          text: 'Пожалуйста, пришлите фото или отправьте /skip.',
+        });
+      }
+    }
+  }
+}
+
+// Long polling: запускается один раз после старта сервера.
+// getUpdates с timeout=25 — запрос висит до 25 секунд если нет событий,
+// event loop при этом не блокируется (await).
+async function startBotPolling() {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  let offset = 0;
+  console.log('Telegram-бот запущен (long polling)');
+  for (;;) {
+    try {
+      const res = await fetch(
+        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates` +
+        `?timeout=25&offset=${offset}&allowed_updates=["message","callback_query"]`
+      );
+      const data = await res.json();
+      if (data.ok && data.result.length > 0) {
+        for (const update of data.result) {
+          handleBotUpdate(update).catch((e) => console.error('handleBotUpdate error:', e));
+          offset = update.update_id + 1;
+        }
+      }
+    } catch (e) {
+      console.error('Bot polling error:', e);
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+  }
+}
+
+// ============================================================
 // Запуск сервера
 // ============================================================
 
 app.listen(PORT, () => {
   console.log(`Прилавка API запущен на порту ${PORT}`);
+  startBotPolling();
 });
