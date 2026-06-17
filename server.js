@@ -1437,6 +1437,20 @@ app.delete('/api/admin/rewards/:id', requireAuth, async (req, res) => {
 });
 
 // ============================================================
+// Временные миграции (удалить после применения)
+// ============================================================
+
+app.get('/api/migrate-image-url', async (req, res) => {
+  try {
+    await query('ALTER TABLE products ADD COLUMN IF NOT EXISTS image_url TEXT');
+    res.json({ ok: true, message: 'Колонка image_url добавлена (или уже существовала)' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================
 // Запуск сервера
 // ============================================================
 
