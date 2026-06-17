@@ -249,7 +249,7 @@ app.get('/api/catalog', async (req, res) => {
     const [categoriesRes, productsRes, reviewsRes, deliveriesRes] = await Promise.all([
       query('SELECT * FROM categories ORDER BY sort_order ASC'),
       query('SELECT * FROM products WHERE is_active = true ORDER BY sort_order ASC, created_at ASC'),
-      query('SELECT * FROM reviews ORDER BY sort_order ASC'),
+      query("SELECT * FROM reviews WHERE status = 'published' ORDER BY sort_order ASC"),
       query('SELECT * FROM deliveries ORDER BY sort_order ASC'),
     ]);
 
@@ -564,6 +564,59 @@ app.post('/api/orders', async (req, res) => {
     sendTelegramMessage(notification);
 
     res.status(201).json({ id: order.id, status: order.status, total: finalTotal, discount: discountAmount, pointsSpent });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Пресет эмодзи для отзывов от клиентов (назначается случайно)
+const REVIEW_EMOJIS = ['😊', '🌿', '🥕', '🧺', '👍'];
+
+// Проверяет, может ли пользователь оставить отзыв:
+// есть хотя бы один доставленный заказ и ещё нет отзыва от этого пользователя.
+app.get('/api/users/:telegramId/review-eligibility', async (req, res) => {
+  const { telegramId } = req.params;
+  if (!telegramId || telegramId === '0') return res.json({ canReview: false });
+  try {
+    const [ordersRes, reviewRes] = await Promise.all([
+      query("SELECT 1 FROM orders WHERE telegram_user_id = $1 AND status = 'delivered' LIMIT 1", [telegramId]),
+      query('SELECT 1 FROM reviews WHERE telegram_user_id = $1 LIMIT 1', [telegramId]),
+    ]);
+    const canReview = ordersRes.rows.length > 0 && reviewRes.rows.length === 0;
+    res.json({ canReview });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Публичный эндпоинт: клиент отправляет отзыв из мини-приложения.
+// Создаёт запись со status = 'pending' — отзыв не показывается до публикации в админке.
+app.post('/api/reviews', async (req, res) => {
+  const { telegramUserId, firstName, area, stars, text } = req.body || {};
+  if (!telegramUserId || !text || !text.trim()) {
+    return res.status(400).json({ error: 'Укажите telegramUserId и text' });
+  }
+  try {
+    const existingRes = await query('SELECT 1 FROM reviews WHERE telegram_user_id = $1', [telegramUserId]);
+    if (existingRes.rows.length > 0) {
+      return res.status(409).json({ error: 'Вы уже оставляли отзыв' });
+    }
+    const emoji = REVIEW_EMOJIS[Math.floor(Math.random() * REVIEW_EMOJIS.length)];
+    await query(
+      `INSERT INTO reviews (name, area, stars, text, emoji, status, telegram_user_id)
+       VALUES ($1, $2, $3, $4, $5, 'pending', $6)`,
+      [
+        (firstName || 'Клиент').trim(),
+        (area || '').trim() || 'Москва',
+        Math.min(5, Math.max(1, Number(stars) || 5)),
+        text.trim(),
+        emoji,
+        telegramUserId,
+      ]
+    );
+    res.status(201).json({ ok: true });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
@@ -1283,7 +1336,7 @@ app.delete('/api/admin/promo-codes/:id', requireAuth, async (req, res) => {
 
 app.get('/api/admin/reviews', requireAuth, async (req, res) => {
   try {
-    const result = await query('SELECT * FROM reviews ORDER BY sort_order ASC, id ASC');
+    const result = await query('SELECT * FROM reviews ORDER BY id DESC');
     res.json(result.rows.map((r) => ({
       id: r.id,
       name: r.name,
@@ -1293,6 +1346,8 @@ app.get('/api/admin/reviews', requireAuth, async (req, res) => {
       emoji: r.emoji,
       sortOrder: r.sort_order,
       imageUrl: r.image_url || null,
+      status: r.status || 'published',
+      telegramUserId: r.telegram_user_id || null,
     })));
   } catch (e) {
     console.error(e);
@@ -1324,6 +1379,23 @@ app.delete('/api/admin/reviews/:id', requireAuth, async (req, res) => {
     const result = await query('DELETE FROM reviews WHERE id = $1', [req.params.id]);
     if (result.rowCount === 0) return res.status(404).json({ error: 'Отзыв не найден' });
     res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.patch('/api/admin/reviews/:id', requireAuth, async (req, res) => {
+  const { status } = req.body || {};
+  if (!status) return res.status(400).json({ error: 'Укажите status' });
+  try {
+    const result = await query(
+      'UPDATE reviews SET status = $1 WHERE id = $2 RETURNING *',
+      [status, req.params.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Отзыв не найден' });
+    const r = result.rows[0];
+    res.json({ id: r.id, status: r.status });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
