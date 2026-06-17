@@ -43,6 +43,7 @@ function toProductDTO(row) {
     pricing: row.pricing,
     isActive: row.is_active,
     sortOrder: row.sort_order,
+    imageUrl: row.image_url || null,
   };
 }
 
@@ -878,8 +879,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
   try {
     await query(
       `INSERT INTO products
-        (id, title, price, weight, emoji, bg, category, badge_type, badge_label, composition, suppliers, pricing, is_active, sort_order)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+        (id, title, price, weight, emoji, bg, category, badge_type, badge_label, composition, suppliers, pricing, is_active, sort_order, image_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
       [
         p.id,
         p.title,
@@ -895,6 +896,7 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
         JSON.stringify(p.pricing || []),
         p.isActive !== false,
         p.sortOrder || 0,
+        p.imageUrl || null,
       ]
     );
     const result = await query('SELECT * FROM products WHERE id = $1', [p.id]);
@@ -931,8 +933,9 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         pricing = $11,
         is_active = $12,
         sort_order = $13,
+        image_url = $14,
         updated_at = now()
-       WHERE id = $14`,
+       WHERE id = $15`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -947,6 +950,7 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         p.pricing !== undefined ? JSON.stringify(p.pricing) : JSON.stringify(cur.pricing),
         p.isActive ?? cur.is_active,
         p.sortOrder ?? cur.sort_order,
+        p.imageUrl !== undefined ? (p.imageUrl || null) : (cur.image_url || null),
         req.params.id,
       ]
     );
