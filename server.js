@@ -1613,6 +1613,76 @@ app.delete('/api/admin/rewards/:id', requireAuth, async (req, res) => {
 });
 
 // ============================================================
+// Админские маршруты — статистика
+// ============================================================
+
+app.get('/api/admin/stats', requireAuth, async (req, res) => {
+  try {
+    const [
+      revenueRes,
+      statusCountsRes,
+      usersCountRes,
+      topProductsRes,
+      revenueByDayRes,
+    ] = await Promise.all([
+      query(`
+        SELECT COALESCE(SUM(total), 0)::int AS total_revenue
+        FROM orders WHERE status = 'delivered'
+      `),
+      query(`
+        SELECT status, COUNT(*)::int AS count
+        FROM orders
+        GROUP BY status
+      `),
+      query(`SELECT COUNT(*)::int AS count FROM users`),
+      query(`
+        SELECT
+          item->>'title' AS title,
+          SUM((item->>'qty')::int) AS total_qty
+        FROM orders, jsonb_array_elements(items) AS item
+        WHERE status != 'cancelled'
+          AND (item->>'isReward')::boolean IS NOT TRUE
+        GROUP BY item->>'title'
+        ORDER BY total_qty DESC
+        LIMIT 5
+      `),
+      query(`
+        SELECT
+          TO_CHAR(DATE(created_at AT TIME ZONE 'Europe/Moscow'), 'YYYY-MM-DD') AS day,
+          SUM(total)::int AS revenue
+        FROM orders
+        WHERE status = 'delivered'
+          AND created_at >= now() - INTERVAL '7 days'
+        GROUP BY DATE(created_at AT TIME ZONE 'Europe/Moscow')
+        ORDER BY day ASC
+      `),
+    ]);
+
+    const statusCounts = {};
+    for (const row of statusCountsRes.rows) {
+      statusCounts[row.status] = row.count;
+    }
+
+    res.json({
+      totalRevenue: revenueRes.rows[0].total_revenue,
+      ordersByStatus: statusCounts,
+      usersCount: usersCountRes.rows[0].count,
+      topProducts: topProductsRes.rows.map((r) => ({
+        title: r.title,
+        totalQty: Number(r.total_qty),
+      })),
+      revenueByDay: revenueByDayRes.rows.map((r) => ({
+        day: r.day,
+        revenue: r.revenue,
+      })),
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
 // Запуск сервера
 // ============================================================
 
