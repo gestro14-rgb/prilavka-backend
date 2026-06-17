@@ -1683,6 +1683,30 @@ app.get('/api/admin/stats', requireAuth, async (req, res) => {
 });
 
 // ============================================================
+// Временный эндпоинт — миграция 007 (удалить после применения)
+// ============================================================
+
+app.post('/api/admin/run-migration-007', requireAuth, async (req, res) => {
+  try {
+    await query(`
+      CREATE TABLE IF NOT EXISTS delivery_schedule (
+        id SERIAL PRIMARY KEY,
+        date DATE NOT NULL UNIQUE,
+        is_available BOOLEAN NOT NULL DEFAULT true,
+        slot TEXT,
+        note TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    res.json({ ok: true, message: 'Таблица delivery_schedule создана' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================
 // Запуск сервера
 // ============================================================
 
