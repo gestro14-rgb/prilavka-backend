@@ -1554,6 +1554,17 @@ app.get('/api/migrate-review-image-url', async (req, res) => {
   }
 });
 
+app.get('/api/migrate-review-status', async (req, res) => {
+  try {
+    await query("ALTER TABLE reviews ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'published'");
+    await query('ALTER TABLE reviews ADD COLUMN IF NOT EXISTS telegram_user_id BIGINT');
+    res.json({ ok: true, message: 'Колонки status и telegram_user_id в reviews добавлены (или уже существовали)' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ============================================================
 // Запуск сервера
 // ============================================================
