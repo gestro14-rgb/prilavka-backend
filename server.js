@@ -16,6 +16,7 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID || '';
 
 const REFERRAL_DISCOUNT = 200;
+const DEFAULT_SLOT = '18:00–21:00';
 const REFERRAL_POINTS_REWARD = 100;
 const POINTS_PERCENT = 0.05;
 const REFERRAL_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -1676,6 +1677,121 @@ app.get('/api/admin/stats', requireAuth, async (req, res) => {
         revenue: r.revenue,
       })),
     });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
+// Расписание доставки
+// ============================================================
+
+// Строит массив YYYY-MM-DD для N дней начиная с сегодня (по МСК).
+function buildDateRange(days) {
+  const result = [];
+  const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Moscow' }));
+  for (let i = 0; i < days; i++) {
+    const d = new Date(now);
+    d.setDate(now.getDate() + i);
+    result.push(d.toISOString().slice(0, 10));
+  }
+  return result;
+}
+
+// Мерджит записи из БД с дефолтами для заданного диапазона дат.
+function mergeSchedule(dates, rows) {
+  const byDate = {};
+  for (const r of rows) {
+    byDate[r.date.toISOString().slice(0, 10)] = r;
+  }
+  return dates.map((date) => {
+    const r = byDate[date];
+    return {
+      id: r?.id ?? null,
+      date,
+      isAvailable: r ? r.is_available : true,
+      slot: r?.slot || DEFAULT_SLOT,
+      note: r?.note || null,
+    };
+  });
+}
+
+// Публичный: ближайшие 7 дней расписания доставки
+app.get('/api/delivery-schedule', async (req, res) => {
+  try {
+    const dates = buildDateRange(7);
+    const result = await query(
+      `SELECT id, date, is_available, slot, note
+       FROM delivery_schedule
+       WHERE date = ANY($1::date[])`,
+      [dates]
+    );
+    res.json(mergeSchedule(dates, result.rows));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Админ: те же 7 дней (с id для редактирования)
+app.get('/api/admin/delivery-schedule', requireAuth, async (req, res) => {
+  try {
+    const dates = buildDateRange(7);
+    const result = await query(
+      `SELECT id, date, is_available, slot, note
+       FROM delivery_schedule
+       WHERE date = ANY($1::date[])`,
+      [dates]
+    );
+    res.json(mergeSchedule(dates, result.rows));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Upsert переопределения для конкретной даты
+app.post('/api/admin/delivery-schedule', requireAuth, async (req, res) => {
+  const { date, isAvailable, slot, note } = req.body || {};
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ error: 'Укажите date в формате YYYY-MM-DD' });
+  }
+  if (typeof isAvailable !== 'boolean') {
+    return res.status(400).json({ error: 'isAvailable должен быть boolean' });
+  }
+  try {
+    const result = await query(
+      `INSERT INTO delivery_schedule (date, is_available, slot, note)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (date) DO UPDATE SET
+         is_available = EXCLUDED.is_available,
+         slot = EXCLUDED.slot,
+         note = EXCLUDED.note,
+         updated_at = now()
+       RETURNING id, date, is_available, slot, note`,
+      [date, isAvailable, slot || null, note || null]
+    );
+    const r = result.rows[0];
+    res.json({
+      id: r.id,
+      date: r.date.toISOString().slice(0, 10),
+      isAvailable: r.is_available,
+      slot: r.slot || DEFAULT_SLOT,
+      note: r.note || null,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Удалить переопределение (дата возвращается к дефолту)
+app.delete('/api/admin/delivery-schedule/:id', requireAuth, async (req, res) => {
+  try {
+    const result = await query('DELETE FROM delivery_schedule WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Запись не найдена' });
+    res.json({ ok: true });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
