@@ -20,6 +20,7 @@ const REFERRAL_POINTS_REWARD = 100;
 const POINTS_PERCENT = 0.05;
 const REFERRAL_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const REFERRAL_CODE_LENGTH = 6;
+const MIN_ORDER_TOTAL = 1990;
 
 // ============================================================
 // Вспомогательные функции
@@ -390,6 +391,10 @@ app.post('/api/orders', async (req, res) => {
 
   if (!Array.isArray(items) || items.length === 0 || total == null) {
     return res.status(400).json({ error: 'Укажите items и total' });
+  }
+
+  if (total < MIN_ORDER_TOTAL) {
+    return res.status(400).json({ error: 'Минимальная сумма заказа — 1 990 ₽' });
   }
 
   if (promoCode && referralCode) {
