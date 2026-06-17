@@ -1241,10 +1241,33 @@ app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
       const pointsToAward = Math.floor(Number(o.total) * POINTS_PERCENT);
       if (pointsToAward > 0) {
         try {
+          const balanceBefore = await query(
+            'SELECT points FROM users WHERE telegram_id = $1',
+            [o.telegram_user_id]
+          );
+          const oldPoints = balanceBefore.rows[0]?.points ?? 0;
+
           await query(
             'UPDATE users SET points = points + $1, updated_at = now() WHERE telegram_id = $2',
             [pointsToAward, o.telegram_user_id]
           );
+
+          const newPoints = oldPoints + pointsToAward;
+
+          // Уведомление при пересечении порога: новый баланс >= стоимость награды, старый — нет
+          const rewardRes = await query(
+            `SELECT title, points_cost FROM rewards
+             WHERE is_active = true AND points_cost <= $1 AND points_cost > $2
+             ORDER BY points_cost ASC LIMIT 1`,
+            [newPoints, oldPoints]
+          );
+          if (rewardRes.rows[0]) {
+            const reward = rewardRes.rows[0];
+            sendTelegramMessageToChat(
+              o.telegram_user_id,
+              `🎁 У вас ${newPoints} баллов — достаточно для получения награды «${reward.title}»! Откройте приложение чтобы забрать её.`
+            );
+          }
         } catch (e) {
           console.error('Ошибка начисления баллов за заказ:', e);
         }
