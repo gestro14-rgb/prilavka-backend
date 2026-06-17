@@ -262,6 +262,7 @@ app.get('/api/catalog', async (req, res) => {
         stars: r.stars,
         text: r.text,
         emoji: r.emoji,
+        imageUrl: r.image_url || null,
       })),
       deliveries: deliveriesRes.rows.map((d) => ({
         emoji: d.emoji,
@@ -1291,6 +1292,7 @@ app.get('/api/admin/reviews', requireAuth, async (req, res) => {
       text: r.text,
       emoji: r.emoji,
       sortOrder: r.sort_order,
+      imageUrl: r.image_url || null,
     })));
   } catch (e) {
     console.error(e);
@@ -1299,18 +1301,18 @@ app.get('/api/admin/reviews', requireAuth, async (req, res) => {
 });
 
 app.post('/api/admin/reviews', requireAuth, async (req, res) => {
-  const { name, area, stars, text, emoji, sortOrder } = req.body || {};
+  const { name, area, stars, text, emoji, sortOrder, imageUrl } = req.body || {};
   if (!name || !area || !text || !emoji) {
     return res.status(400).json({ error: 'Обязательные поля: name, area, text, emoji' });
   }
   try {
     const result = await query(
-      `INSERT INTO reviews (name, area, stars, text, emoji, sort_order)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [name, area, Number(stars) || 5, text, emoji, Number(sortOrder) || 0]
+      `INSERT INTO reviews (name, area, stars, text, emoji, sort_order, image_url)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [name, area, Number(stars) || 5, text, emoji, Number(sortOrder) || 0, imageUrl || null]
     );
     const r = result.rows[0];
-    res.status(201).json({ id: r.id, name: r.name, area: r.area, stars: r.stars, text: r.text, emoji: r.emoji, sortOrder: r.sort_order });
+    res.status(201).json({ id: r.id, name: r.name, area: r.area, stars: r.stars, text: r.text, emoji: r.emoji, sortOrder: r.sort_order, imageUrl: r.image_url || null });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
