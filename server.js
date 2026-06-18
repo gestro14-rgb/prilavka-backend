@@ -248,18 +248,6 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true });
 });
 
-// Временный эндпоинт миграции — добавляет колонку phone в orders.
-// Удалить после применения.
-app.get('/api/migrate-phone', async (req, res) => {
-  try {
-    await query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS phone TEXT');
-    res.json({ ok: true, message: 'Колонка phone добавлена (или уже существовала)' });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
 
 // Весь каталог
 
