@@ -248,38 +248,6 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true });
 });
 
-// Временный эндпоинт миграции — создаёт таблицу districts. Удалить после применения.
-app.get('/api/migrate-districts', async (req, res) => {
-  try {
-    await query(`
-      CREATE TABLE IF NOT EXISTS districts (
-        id SERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        sort_order INTEGER NOT NULL DEFAULT 0,
-        is_active BOOLEAN NOT NULL DEFAULT true,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      )
-    `);
-    await query(`
-      INSERT INTO districts (name, sort_order) VALUES
-        ('Теплый Стан',       1),
-        ('Коньково',          2),
-        ('Ясенево',           3),
-        ('Новоясеневская',    4),
-        ('Беляево',           5),
-        ('Генерала Тюленева', 6),
-        ('Тютчевская',        7),
-        ('Тропарево',         8),
-        ('Коммунарка',        9)
-      ON CONFLICT DO NOTHING
-    `);
-    res.json({ ok: true, message: 'Таблица districts создана и заполнена' });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
 // Публичный список активных районов доставки для мини-приложения
 app.get('/api/districts', async (req, res) => {
   try {
