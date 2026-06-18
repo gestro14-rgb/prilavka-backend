@@ -232,6 +232,10 @@ function formatOrderNotification(order) {
     lines.push(`👤 ${who}`);
   }
 
+  if (order.phone) {
+    lines.push(`📞 ${order.phone}`);
+  }
+
   return lines.join('\n');
 }
 
@@ -387,6 +391,7 @@ app.post('/api/orders', async (req, res) => {
     deliverySlot,
     addressStreet,
     addressDetails,
+    phone,
     comment,
     paymentMethod,
     telegramUser,
@@ -493,8 +498,8 @@ app.post('/api/orders', async (req, res) => {
 
     const result = await query(
       `INSERT INTO orders
-        (items, total, delivery_date, delivery_slot, address_street, address_details, comment, payment_method, promo_code, discount_amount, telegram_user_id, telegram_username, telegram_first_name, referral_code)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        (items, total, delivery_date, delivery_slot, address_street, address_details, phone, comment, payment_method, promo_code, discount_amount, telegram_user_id, telegram_username, telegram_first_name, referral_code)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
        RETURNING *`,
       [
         JSON.stringify(orderItems),
@@ -503,6 +508,7 @@ app.post('/api/orders', async (req, res) => {
         deliverySlot || null,
         addressStreet || null,
         addressDetails ? JSON.stringify(addressDetails) : null,
+        phone || null,
         comment || null,
         paymentMethod === 'cash' ? 'cash' : 'online',
         appliedPromo ? appliedPromo.code : null,
@@ -558,6 +564,7 @@ app.post('/api/orders', async (req, res) => {
       delivery_slot: deliverySlot,
       address_street: addressStreet,
       address_details: addressDetails,
+      phone: phone || null,
       comment,
       payment_method: order.payment_method,
       telegram_first_name: order.telegram_first_name,
@@ -1223,6 +1230,7 @@ app.get('/api/admin/orders', requireAuth, async (req, res) => {
         deliverySlot: o.delivery_slot,
         addressStreet: o.address_street,
         addressDetails: o.address_details,
+        phone: o.phone || null,
         comment: o.comment,
         paymentMethod: o.payment_method,
         paymentStatus: o.payment_status,
