@@ -248,6 +248,51 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true });
 });
 
+// Временный эндпоинт миграции — создаёт таблицу districts. Удалить после применения.
+app.get('/api/migrate-districts', async (req, res) => {
+  try {
+    await query(`
+      CREATE TABLE IF NOT EXISTS districts (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        is_active BOOLEAN NOT NULL DEFAULT true,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await query(`
+      INSERT INTO districts (name, sort_order) VALUES
+        ('Теплый Стан',       1),
+        ('Коньково',          2),
+        ('Ясенево',           3),
+        ('Новоясеневская',    4),
+        ('Беляево',           5),
+        ('Генерала Тюленева', 6),
+        ('Тютчевская',        7),
+        ('Тропарево',         8),
+        ('Коммунарка',        9)
+      ON CONFLICT DO NOTHING
+    `);
+    res.json({ ok: true, message: 'Таблица districts создана и заполнена' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Публичный список активных районов доставки для мини-приложения
+app.get('/api/districts', async (req, res) => {
+  try {
+    const result = await query(
+      'SELECT id, name, sort_order FROM districts WHERE is_active = true ORDER BY sort_order ASC, id ASC'
+    );
+    res.json(result.rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
 
 // Весь каталог
 
@@ -1130,6 +1175,51 @@ app.delete('/api/admin/categories/:id', requireAuth, async (req, res) => {
     if (e.code === '23503') {
       return res.status(409).json({ error: 'Нельзя удалить категорию: в ней есть товары' });
     }
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
+// Админские маршруты — районы доставки
+// ============================================================
+
+app.get('/api/admin/districts', requireAuth, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM districts ORDER BY sort_order ASC, id ASC');
+    res.json(result.rows.map((d) => ({
+      id: d.id, name: d.name, sortOrder: d.sort_order, isActive: d.is_active,
+    })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.post('/api/admin/districts', requireAuth, async (req, res) => {
+  const { name, sortOrder } = req.body || {};
+  if (!name || !String(name).trim()) {
+    return res.status(400).json({ error: 'Укажите название района' });
+  }
+  try {
+    const result = await query(
+      'INSERT INTO districts (name, sort_order) VALUES ($1, $2) RETURNING *',
+      [String(name).trim(), Number(sortOrder) || 0]
+    );
+    const d = result.rows[0];
+    res.status(201).json({ id: d.id, name: d.name, sortOrder: d.sort_order, isActive: d.is_active });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.delete('/api/admin/districts/:id', requireAuth, async (req, res) => {
+  try {
+    const result = await query('DELETE FROM districts WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Район не найден' });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
