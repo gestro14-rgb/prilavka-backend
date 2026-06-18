@@ -170,6 +170,7 @@ function sendTelegramMessage(text) {
 
 const ORDER_STATUS_NOTIFICATIONS = {
   in_progress: (id) => `🥗 Ваш заказ #${id} готовится!`,
+  courier:     (id) => `🛵 Курьер уже едет к вам! Ожидайте в ближайшее время.`,
   delivered:   (id) => `✅ Заказ #${id} доставлен. Спасибо!`,
   cancelled:   (id) => `❌ Заказ #${id} отменён. Свяжитесь с нами если вопросы.`,
 };
