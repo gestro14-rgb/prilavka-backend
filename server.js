@@ -645,6 +645,51 @@ app.post('/api/orders/:id/cancel', async (req, res) => {
   }
 });
 
+// Публичный просмотр заказа по id — только владелец (проверяем по telegramUserId в query).
+app.get('/api/orders/:id', async (req, res) => {
+  const orderId = parseInt(req.params.id, 10);
+  const { telegramUserId } = req.query;
+
+  if (!telegramUserId || isNaN(orderId)) {
+    return res.status(400).json({ error: 'Укажите telegramUserId' });
+  }
+
+  try {
+    const result = await query(
+      `SELECT id, status, items, total, discount_amount, delivery_date, delivery_slot,
+              address_street, address_details, phone, comment, payment_method, created_at,
+              telegram_user_id
+       FROM orders WHERE id = $1`,
+      [orderId]
+    );
+    const order = result.rows[0];
+
+    if (!order) return res.status(404).json({ error: 'Заказ не найден' });
+    if (String(order.telegram_user_id) !== String(telegramUserId)) {
+      return res.status(403).json({ error: 'Нет доступа к этому заказу' });
+    }
+
+    res.json({
+      id: order.id,
+      status: order.status,
+      items: order.items,
+      total: order.total,
+      discountAmount: order.discount_amount || 0,
+      deliveryDate: order.delivery_date,
+      deliverySlot: order.delivery_slot,
+      addressStreet: order.address_street,
+      addressDetails: order.address_details,
+      phone: order.phone,
+      comment: order.comment,
+      paymentMethod: order.payment_method,
+      createdAt: order.created_at,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
 // Пресет эмодзи для отзывов от клиентов (назначается случайно)
 const REVIEW_EMOJIS = ['😊', '🌿', '🥕', '🧺', '👍'];
 
