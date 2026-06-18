@@ -574,6 +574,56 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
+// Публичная отмена заказа клиентом — только статус new, не старше 5 минут.
+// Принимает telegramUserId для проверки принадлежности заказа.
+app.post('/api/orders/:id/cancel', async (req, res) => {
+  const orderId = req.params.id;
+  const { telegramUserId } = req.body || {};
+
+  if (!telegramUserId) {
+    return res.status(400).json({ error: 'Укажите telegramUserId' });
+  }
+
+  try {
+    const result = await query('SELECT * FROM orders WHERE id = $1', [orderId]);
+    const order = result.rows[0];
+
+    if (!order) {
+      return res.status(404).json({ error: 'Заказ не найден' });
+    }
+
+    if (String(order.telegram_user_id) !== String(telegramUserId)) {
+      return res.status(403).json({ error: 'Нет доступа к этому заказу' });
+    }
+
+    if (order.status !== 'new') {
+      return res.status(409).json({ error: 'Заказ уже обрабатывается и не может быть отменён' });
+    }
+
+    const ageMs = Date.now() - new Date(order.created_at).getTime();
+    if (ageMs > 5 * 60 * 1000) {
+      return res.status(409).json({ error: 'Время отмены истекло' });
+    }
+
+    await query(
+      "UPDATE orders SET status = 'cancelled', updated_at = now() WHERE id = $1",
+      [orderId]
+    );
+
+    sendTelegramMessage(
+      `❌ Заказ #${order.id} отменён клиентом` +
+      (order.telegram_first_name || order.telegram_username
+        ? ` (${[order.telegram_first_name, order.telegram_username ? '@' + order.telegram_username : null].filter(Boolean).join(' ')})`
+        : '')
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
 // Пресет эмодзи для отзывов от клиентов (назначается случайно)
 const REVIEW_EMOJIS = ['😊', '🌿', '🥕', '🧺', '👍'];
 
