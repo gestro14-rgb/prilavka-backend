@@ -48,6 +48,18 @@ function toProductDTO(row) {
     isActive: row.is_active,
     sortOrder: row.sort_order,
     imageUrl: row.image_url || null,
+    isBundle: row.is_bundle ?? false,
+  };
+}
+
+function toBundleItemDTO(row) {
+  return {
+    id: row.id,
+    itemName: row.item_name,
+    itemEmoji: row.item_emoji,
+    alternatives: row.alternatives,
+    isRemovable: row.is_removable,
+    sortOrder: row.sort_order,
   };
 }
 
@@ -268,16 +280,26 @@ app.get('/api/districts', async (req, res) => {
 // Весь каталог (категории + товары + отзывы + доставки) — то, что раньше было в products.js
 app.get('/api/catalog', async (req, res) => {
   try {
-    const [categoriesRes, productsRes, reviewsRes, deliveriesRes] = await Promise.all([
+    const [categoriesRes, productsRes, reviewsRes, deliveriesRes, compositionsRes] = await Promise.all([
       query('SELECT * FROM categories ORDER BY sort_order ASC'),
       query('SELECT * FROM products WHERE is_active = true ORDER BY sort_order ASC, created_at ASC'),
       query("SELECT * FROM reviews WHERE status = 'published' ORDER BY sort_order ASC"),
       query('SELECT * FROM deliveries ORDER BY sort_order ASC'),
+      query('SELECT * FROM набор_состав ORDER BY product_id, sort_order'),
     ]);
+
+    const compositionsByProduct = {};
+    for (const row of compositionsRes.rows) {
+      if (!compositionsByProduct[row.product_id]) compositionsByProduct[row.product_id] = [];
+      compositionsByProduct[row.product_id].push(toBundleItemDTO(row));
+    }
 
     res.json({
       categories: [{ id: 'all', label: 'Все' }, ...categoriesRes.rows.map((c) => ({ id: c.id, label: c.label }))],
-      products: productsRes.rows.map(toProductDTO),
+      products: productsRes.rows.map((row) => ({
+        ...toProductDTO(row),
+        bundleComposition: compositionsByProduct[row.id] ?? null,
+      })),
       reviews: reviewsRes.rows.map((r) => ({
         name: r.name,
         area: r.area,
@@ -1035,9 +1057,15 @@ app.get('/api/admin/products', requireAuth, async (req, res) => {
 // Один товар по id
 app.get('/api/admin/products/:id', requireAuth, async (req, res) => {
   try {
-    const result = await query('SELECT * FROM products WHERE id = $1', [req.params.id]);
-    if (!result.rows[0]) return res.status(404).json({ error: 'Товар не найден' });
-    res.json(toProductDTO(result.rows[0]));
+    const [productRes, compositionRes] = await Promise.all([
+      query('SELECT * FROM products WHERE id = $1', [req.params.id]),
+      query('SELECT * FROM набор_состав WHERE product_id = $1 ORDER BY sort_order', [req.params.id]),
+    ]);
+    if (!productRes.rows[0]) return res.status(404).json({ error: 'Товар не найден' });
+    res.json({
+      ...toProductDTO(productRes.rows[0]),
+      bundleComposition: compositionRes.rows.map(toBundleItemDTO),
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
@@ -1053,8 +1081,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
   try {
     await query(
       `INSERT INTO products
-        (id, title, price, weight, emoji, bg, category, badge_type, badge_label, composition, suppliers, pricing, is_active, sort_order, image_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+        (id, title, price, weight, emoji, bg, category, badge_type, badge_label, composition, suppliers, pricing, is_active, sort_order, image_url, is_bundle)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
       [
         p.id,
         p.title,
@@ -1071,6 +1099,7 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
         p.isActive !== false,
         p.sortOrder || 0,
         p.imageUrl || null,
+        p.isBundle === true,
       ]
     );
     const result = await query('SELECT * FROM products WHERE id = $1', [p.id]);
@@ -1108,8 +1137,9 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         is_active = $12,
         sort_order = $13,
         image_url = $14,
+        is_bundle = $15,
         updated_at = now()
-       WHERE id = $15`,
+       WHERE id = $16`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -1125,6 +1155,7 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         p.isActive ?? cur.is_active,
         p.sortOrder ?? cur.sort_order,
         p.imageUrl !== undefined ? (p.imageUrl || null) : (cur.image_url || null),
+        p.isBundle !== undefined ? p.isBundle === true : cur.is_bundle,
         req.params.id,
       ]
     );
@@ -1141,6 +1172,98 @@ app.delete('/api/admin/products/:id', requireAuth, async (req, res) => {
   try {
     const result = await query('DELETE FROM products WHERE id = $1', [req.params.id]);
     if (result.rowCount === 0) return res.status(404).json({ error: 'Товар не найден' });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
+// Состав набора (набор_состав) — CRUD для админки
+// ============================================================
+
+// Список позиций состава товара-набора
+app.get('/api/admin/products/:id/composition', requireAuth, async (req, res) => {
+  try {
+    const result = await query(
+      'SELECT * FROM набор_состав WHERE product_id = $1 ORDER BY sort_order, id',
+      [req.params.id]
+    );
+    res.json(result.rows.map(toBundleItemDTO));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Добавить позицию в состав
+app.post('/api/admin/products/:id/composition', requireAuth, async (req, res) => {
+  const { itemName, itemEmoji, alternatives, isRemovable, sortOrder } = req.body || {};
+  if (!itemName) return res.status(400).json({ error: 'itemName обязателен' });
+  try {
+    const productCheck = await query('SELECT id FROM products WHERE id = $1', [req.params.id]);
+    if (!productCheck.rows[0]) return res.status(404).json({ error: 'Товар не найден' });
+
+    const result = await query(
+      `INSERT INTO набор_состав (product_id, item_name, item_emoji, alternatives, is_removable, sort_order)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [
+        req.params.id,
+        itemName,
+        itemEmoji || '',
+        JSON.stringify(Array.isArray(alternatives) ? alternatives : []),
+        isRemovable !== false,
+        sortOrder ?? 0,
+      ]
+    );
+    res.status(201).json(toBundleItemDTO(result.rows[0]));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Обновить позицию состава
+app.put('/api/admin/products/:id/composition/:itemId', requireAuth, async (req, res) => {
+  const { itemName, itemEmoji, alternatives, isRemovable, sortOrder } = req.body || {};
+  try {
+    const existing = await query(
+      'SELECT * FROM набор_состав WHERE id = $1 AND product_id = $2',
+      [req.params.itemId, req.params.id]
+    );
+    if (!existing.rows[0]) return res.status(404).json({ error: 'Позиция не найдена' });
+    const cur = existing.rows[0];
+
+    const result = await query(
+      `UPDATE набор_состав SET
+        item_name = $1, item_emoji = $2, alternatives = $3, is_removable = $4, sort_order = $5, updated_at = now()
+       WHERE id = $6 AND product_id = $7 RETURNING *`,
+      [
+        itemName ?? cur.item_name,
+        itemEmoji !== undefined ? itemEmoji : cur.item_emoji,
+        alternatives !== undefined ? JSON.stringify(alternatives) : JSON.stringify(cur.alternatives),
+        isRemovable !== undefined ? isRemovable !== false : cur.is_removable,
+        sortOrder !== undefined ? sortOrder : cur.sort_order,
+        req.params.itemId,
+        req.params.id,
+      ]
+    );
+    res.json(toBundleItemDTO(result.rows[0]));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Удалить позицию состава
+app.delete('/api/admin/products/:id/composition/:itemId', requireAuth, async (req, res) => {
+  try {
+    const result = await query(
+      'DELETE FROM набор_состав WHERE id = $1 AND product_id = $2',
+      [req.params.itemId, req.params.id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Позиция не найдена' });
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
