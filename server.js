@@ -2291,20 +2291,6 @@ async function startBotPolling() {
 }
 
 // ============================================================
-// Временный эндпоинт миграции — удалить после применения на prod
-// ============================================================
-
-app.get('/api/migrate-leave-at-door', async (req, res) => {
-  try {
-    await query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS leave_at_door BOOLEAN NOT NULL DEFAULT false');
-    res.json({ ok: true, message: 'Migration 011 applied: leave_at_door column added' });
-  } catch (e) {
-    console.error('Migration 011 error:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ============================================================
 // Запуск сервера
 // ============================================================
 
