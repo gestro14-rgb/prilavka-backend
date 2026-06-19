@@ -234,6 +234,10 @@ function formatOrderNotification(order) {
     lines.push(`💬 Комментарий к заказу: ${order.comment}`);
   }
 
+  if (order.leave_at_door) {
+    lines.push(`🚪 Оставить у двери`);
+  }
+
   lines.push('');
   const paymentLabel = order.payment_method === 'cash' ? 'При получении (наличные/карта курьеру)' : 'Онлайн';
   lines.push(`💳 Оплата: ${paymentLabel}`);
@@ -434,6 +438,7 @@ app.post('/api/orders', async (req, res) => {
     promoCode,
     referralCode,
     pointsToSpend,
+    leaveAtDoor,
   } = req.body || {};
 
   if (!Array.isArray(items) || items.length === 0 || total == null) {
@@ -534,8 +539,8 @@ app.post('/api/orders', async (req, res) => {
 
     const result = await query(
       `INSERT INTO orders
-        (items, total, delivery_date, delivery_slot, address_street, address_details, phone, comment, payment_method, promo_code, discount_amount, telegram_user_id, telegram_username, telegram_first_name, referral_code)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        (items, total, delivery_date, delivery_slot, address_street, address_details, phone, comment, payment_method, promo_code, discount_amount, telegram_user_id, telegram_username, telegram_first_name, referral_code, leave_at_door)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
        RETURNING *`,
       [
         JSON.stringify(orderItems),
@@ -553,6 +558,7 @@ app.post('/api/orders', async (req, res) => {
         telegramUser?.username || null,
         telegramUser?.firstName || null,
         appliedReferral ? appliedReferralCode : null,
+        leaveAtDoor === true,
       ]
     );
 
@@ -602,6 +608,7 @@ app.post('/api/orders', async (req, res) => {
       address_details: addressDetails,
       phone: phone || null,
       comment,
+      leave_at_door: order.leave_at_door,
       payment_method: order.payment_method,
       telegram_first_name: order.telegram_first_name,
       telegram_username: order.telegram_username,
@@ -679,8 +686,8 @@ app.get('/api/orders/:id', async (req, res) => {
   try {
     const result = await query(
       `SELECT id, status, items, total, discount_amount, delivery_date, delivery_slot,
-              address_street, address_details, phone, comment, payment_method, created_at,
-              telegram_user_id
+              address_street, address_details, phone, comment, payment_method, leave_at_door,
+              created_at, telegram_user_id
        FROM orders WHERE id = $1`,
       [orderId]
     );
@@ -703,6 +710,7 @@ app.get('/api/orders/:id', async (req, res) => {
       addressDetails: order.address_details,
       phone: order.phone,
       comment: order.comment,
+      leaveAtDoor: order.leave_at_door || false,
       paymentMethod: order.payment_method,
       createdAt: order.created_at,
     });
@@ -1467,6 +1475,7 @@ app.get('/api/admin/orders', requireAuth, async (req, res) => {
         discountAmount: o.discount_amount,
         telegramUsername: o.telegram_username,
         telegramFirstName: o.telegram_first_name,
+        leaveAtDoor: o.leave_at_door || false,
         createdAt: o.created_at,
       }))
     );
