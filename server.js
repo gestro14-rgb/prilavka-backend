@@ -2282,6 +2282,34 @@ async function startBotPolling() {
 }
 
 // ============================================================
+// Временный эндпоинт миграции 010 — удалить после применения
+// ============================================================
+
+app.get('/api/migrate-bundle', async (req, res) => {
+  try {
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS is_bundle BOOLEAN NOT NULL DEFAULT false`);
+    await query(`
+      CREATE TABLE IF NOT EXISTS набор_состав (
+        id          SERIAL PRIMARY KEY,
+        product_id  TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        item_name   TEXT NOT NULL,
+        item_emoji  VARCHAR(8) NOT NULL DEFAULT '',
+        alternatives JSONB NOT NULL DEFAULT '[]',
+        is_removable BOOLEAN NOT NULL DEFAULT true,
+        sort_order  INTEGER NOT NULL DEFAULT 0,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_набор_состав_product_id ON набор_состав (product_id, sort_order)`);
+    res.json({ ok: true, message: 'Migration 010 applied (idempotent)' });
+  } catch (e) {
+    console.error('migrate-bundle error:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ============================================================
 // Запуск сервера
 // ============================================================
 
