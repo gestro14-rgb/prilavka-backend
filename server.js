@@ -15,13 +15,34 @@ const YANDEX_GEOCODER_API_KEY = process.env.YANDEX_GEOCODER_API_KEY || '';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID || '';
 
-const REFERRAL_DISCOUNT = 200;
-const DEFAULT_SLOT = '18:00–21:00';
-const REFERRAL_POINTS_REWARD = 100;
-const POINTS_PERCENT = 0.05;
 const REFERRAL_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const REFERRAL_CODE_LENGTH = 6;
-const MIN_ORDER_TOTAL = 1990;
+
+// Write-through settings cache — loaded once at startup, updated on admin PUT.
+// Hardcoded defaults serve as fallback until DB is read.
+let settingsCache = {
+  min_order_total:          '1990',
+  points_percent:           '5',
+  referral_points_reward:   '100',
+  referral_discount:        '200',
+  max_points_spend_percent: '30',
+  default_slot:             '18:00–21:00',
+};
+
+async function loadSettings() {
+  try {
+    const result = await query('SELECT key, value FROM settings');
+    if (result.rows.length > 0) {
+      settingsCache = Object.fromEntries(result.rows.map((r) => [r.key, r.value]));
+    }
+  } catch (e) {
+    console.error('Failed to load settings from DB, using defaults:', e.message);
+  }
+}
+
+function getSetting(key) {
+  return settingsCache[key];
+}
 
 // Состояние диалога отзыва с ботом: telegramId (string) → { step, rating, text, firstName }
 const reviewDialogs = new Map();
@@ -445,8 +466,9 @@ app.post('/api/orders', async (req, res) => {
     return res.status(400).json({ error: 'Укажите items и total' });
   }
 
-  if (total < MIN_ORDER_TOTAL) {
-    return res.status(400).json({ error: 'Минимальная сумма заказа — 1 990 ₽' });
+  const minOrderTotal = Number(getSetting('min_order_total'));
+  if (total < minOrderTotal) {
+    return res.status(400).json({ error: `Минимальная сумма заказа — ${minOrderTotal.toLocaleString('ru-RU')} ₽` });
   }
 
   if (promoCode && referralCode) {
@@ -494,7 +516,7 @@ app.post('/api/orders', async (req, res) => {
             [tid]
           );
           if ((prevRes.rows[0]?.count || 0) === 0) {
-            discountAmount = REFERRAL_DISCOUNT;
+            discountAmount = Number(getSetting('referral_discount'));
             finalTotal = Math.max(0, total - discountAmount);
             appliedReferral = referrer;
           }
@@ -505,7 +527,7 @@ app.post('/api/orders', async (req, res) => {
     // Применяем баллы (только если нет промокода и есть авторизованный пользователь)
     let pointsSpent = 0;
     if (!appliedPromo && !appliedReferral && pointsToSpend > 0 && telegramUser?.id) {
-      const maxByPercent = Math.floor(total * 0.30);
+      const maxByPercent = Math.floor(total * (Number(getSetting('max_points_spend_percent')) / 100));
       const allowed = Math.min(pointsToSpend, maxByPercent);
       if (allowed > 0) {
         const balanceRes = await query('SELECT points FROM users WHERE telegram_id = $1', [telegramUser.id]);
@@ -1005,7 +1027,7 @@ app.get('/api/referral/:code', async (req, res) => {
     res.json({
       valid: true,
       referrerName: referrer.first_name || referrer.username || 'Пользователь',
-      discount: REFERRAL_DISCOUNT,
+      discount: Number(getSetting('referral_discount')),
     });
   } catch (e) {
     console.error(e);
@@ -1512,7 +1534,7 @@ app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
           if (alreadyRewarded.rows.length === 0) {
             await query(
               'UPDATE users SET points = points + $1, updated_at = now() WHERE telegram_id = $2',
-              [REFERRAL_POINTS_REWARD, referrer.telegram_id]
+              [Number(getSetting('referral_points_reward')), referrer.telegram_id]
             );
 
             const referredRes = cur.telegram_user_id
@@ -1523,7 +1545,7 @@ app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
             if (referredId) {
               await query(
                 'INSERT INTO referral_rewards (referrer_id, referred_id, order_id, points_awarded) VALUES ($1,$2,$3,$4)',
-                [referrer.telegram_id, referredId, o.id, REFERRAL_POINTS_REWARD]
+                [referrer.telegram_id, referredId, o.id, Number(getSetting('referral_points_reward'))]
               );
             }
           }
@@ -1535,7 +1557,7 @@ app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
 
     // Начисляем баллы покупателю за доставленный заказ (5% от суммы, округление вниз)
     if (status === 'delivered' && cur.status !== 'delivered' && o.telegram_user_id) {
-      const pointsToAward = Math.floor(Number(o.total) * POINTS_PERCENT);
+      const pointsToAward = Math.floor(Number(o.total) * (Number(getSetting('points_percent')) / 100));
       if (pointsToAward > 0) {
         try {
           const balanceBefore = await query(
@@ -2038,7 +2060,7 @@ function mergeSchedule(dates, rows) {
       id: r?.id ?? null,
       date,
       isAvailable: r ? r.is_available : true,
-      slot: r?.slot || DEFAULT_SLOT,
+      slot: r?.slot || getSetting('default_slot'),
       note: r?.note || null,
     };
   });
@@ -2104,7 +2126,7 @@ app.post('/api/admin/delivery-schedule', requireAuth, async (req, res) => {
       id: r.id,
       date: r.date.toISOString().slice(0, 10),
       isAvailable: r.is_available,
-      slot: r.slot || DEFAULT_SLOT,
+      slot: r.slot || getSetting('default_slot'),
       note: r.note || null,
     });
   } catch (e) {
@@ -2291,8 +2313,46 @@ async function startBotPolling() {
 }
 
 // ============================================================
+// Админские маршруты — настройки
+// ============================================================
+
+app.get('/api/admin/settings', requireAuth, async (req, res) => {
+  try {
+    const result = await query('SELECT key, value, description FROM settings ORDER BY key');
+    res.json(result.rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.put('/api/admin/settings/:key', requireAuth, async (req, res) => {
+  const { key } = req.params;
+  const { value } = req.body || {};
+  if (value == null || String(value).trim() === '') {
+    return res.status(400).json({ error: 'Укажите value' });
+  }
+  try {
+    const result = await query(
+      'UPDATE settings SET value = $1 WHERE key = $2 RETURNING key, value, description',
+      [String(value).trim(), key]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Настройка не найдена' });
+    }
+    settingsCache[key] = String(value).trim();
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
 // Запуск сервера
 // ============================================================
+
+loadSettings().catch((e) => console.error('loadSettings error:', e));
 
 app.listen(PORT, () => {
   console.log(`Прилавка API запущен на порту ${PORT}`);
