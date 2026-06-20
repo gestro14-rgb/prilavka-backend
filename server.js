@@ -2349,6 +2349,37 @@ app.put('/api/admin/settings/:key', requireAuth, async (req, res) => {
 });
 
 // ============================================================
+// Временный эндпоинт миграции — удалить после применения на prod
+// ============================================================
+
+app.get('/api/migrate-settings', async (req, res) => {
+  try {
+    await query(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key         TEXT PRIMARY KEY,
+        value       TEXT NOT NULL,
+        description TEXT
+      )
+    `);
+    await query(`
+      INSERT INTO settings (key, value, description) VALUES
+        ('min_order_total',          '1990',       'Минимальная сумма заказа (₽)'),
+        ('points_percent',           '5',          'Процент баллов от суммы заказа (%)'),
+        ('referral_points_reward',   '100',        'Баллы за первый заказ приглашённого друга'),
+        ('referral_discount',        '200',        'Скидка по реферальному коду (₽)'),
+        ('max_points_spend_percent', '30',         'Макс. % суммы заказа для оплаты баллами'),
+        ('default_slot',             '18:00–21:00','Стандартное время доставки')
+      ON CONFLICT (key) DO NOTHING
+    `);
+    await loadSettings();
+    res.json({ ok: true, message: 'Migration 012 applied: settings table created and seeded', cache: settingsCache });
+  } catch (e) {
+    console.error('Migration 012 error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================
 // Запуск сервера
 // ============================================================
 
