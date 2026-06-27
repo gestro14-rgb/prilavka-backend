@@ -86,6 +86,7 @@ function toProductDTO(row) {
     sortOrder: row.sort_order,
     imageUrl: row.image_url || null,
     isBundle: row.is_bundle ?? false,
+    subcategoryId: row.subcategory_id ?? null,
   };
 }
 
@@ -2380,6 +2381,151 @@ app.put('/api/admin/settings/:key', requireAuth, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
+// Миграция 013 — подкатегории (временный эндпоинт, удалить после запуска)
+// ============================================================
+
+app.get('/api/migrate-subcategories', async (req, res) => {
+  try {
+    // а) Таблица subcategories
+    await query(`
+      CREATE TABLE IF NOT EXISTS subcategories (
+        id          SERIAL PRIMARY KEY,
+        category_id TEXT NOT NULL REFERENCES categories(id),
+        name        TEXT NOT NULL,
+        slug        TEXT NOT NULL UNIQUE,
+        sort_order  INTEGER DEFAULT 0
+      )
+    `);
+
+    // б) Колонка subcategory_id в products
+    await query(`
+      ALTER TABLE products
+        ADD COLUMN IF NOT EXISTS subcategory_id INTEGER REFERENCES subcategories(id)
+    `);
+
+    // в) Засеваем подкатегории
+    const subcatDefs = [
+      // Овощи
+      { category_id: 'vegetables', name: 'Томаты',            slug: 'tomatoes',          sort_order: 1 },
+      { category_id: 'vegetables', name: 'Огурцы',            slug: 'cucumbers',         sort_order: 2 },
+      { category_id: 'vegetables', name: 'Корнеплоды',        slug: 'root-vegetables',   sort_order: 3 },
+      { category_id: 'vegetables', name: 'Капустные',         slug: 'brassicas',         sort_order: 4 },
+      { category_id: 'vegetables', name: 'Перцы',             slug: 'peppers',           sort_order: 5 },
+      { category_id: 'vegetables', name: 'Лук и чеснок',      slug: 'onions-garlic',     sort_order: 6 },
+      { category_id: 'vegetables', name: 'Кабачки и тыквы',   slug: 'squash',            sort_order: 7 },
+      { category_id: 'vegetables', name: 'Прочие овощи',      slug: 'other-vegetables',  sort_order: 8 },
+      // Фрукты
+      { category_id: 'fruits',     name: 'Семечковые',        slug: 'pome-fruits',       sort_order: 1 },
+      { category_id: 'fruits',     name: 'Косточковые',       slug: 'stone-fruits',      sort_order: 2 },
+      { category_id: 'fruits',     name: 'Ягоды и виноград',  slug: 'berries-grapes',    sort_order: 3 },
+      { category_id: 'fruits',     name: 'Бахчевые',          slug: 'melons',            sort_order: 4 },
+      { category_id: 'fruits',     name: 'Экзотические',      slug: 'exotic',            sort_order: 5 },
+      { category_id: 'fruits',     name: 'Цитрусовые',        slug: 'citrus',            sort_order: 6 },
+      // Зелень
+      { category_id: 'greens',     name: 'Свежая зелень',     slug: 'fresh-herbs',       sort_order: 1 },
+      { category_id: 'greens',     name: 'Салаты',            slug: 'salads',            sort_order: 2 },
+      { category_id: 'greens',     name: 'Пряные травы',      slug: 'spice-herbs',       sort_order: 3 },
+      { category_id: 'greens',     name: 'Прочая зелень',     slug: 'other-greens',      sort_order: 4 },
+    ];
+
+    for (const s of subcatDefs) {
+      await query(
+        `INSERT INTO subcategories (category_id, name, slug, sort_order)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name, sort_order = EXCLUDED.sort_order`,
+        [s.category_id, s.name, s.slug, s.sort_order]
+      );
+    }
+
+    // Загружаем id по slug для назначения
+    const { rows: scRows } = await query('SELECT id, slug FROM subcategories');
+    const sc = Object.fromEntries(scRows.map(r => [r.slug, r.id]));
+
+    // г) Привязываем товары к подкатегориям
+    const assignments = [
+      // Овощи
+      { slug: 'tomatoes',
+        sql: `category = 'vegetables' AND (title ILIKE '%томат%' OR title ILIKE '%черри%')` },
+      { slug: 'cucumbers',
+        sql: `category = 'vegetables' AND title ILIKE '%огурц%'` },
+      { slug: 'root-vegetables',
+        sql: `category = 'vegetables' AND (title ILIKE '%морков%' OR title ILIKE '%свёкл%' OR title ILIKE '%редис%' OR title ILIKE '%репа%' OR title ILIKE '%пастернак%' OR title ILIKE '%батат%' OR title ILIKE '%картофел%' OR title ILIKE '%имбир%')` },
+      { slug: 'brassicas',
+        sql: `category = 'vegetables' AND (title ILIKE '%капуст%' OR title ILIKE '%брокколи%' OR title ILIKE '%цветная%')` },
+      { slug: 'peppers',
+        sql: `category = 'vegetables' AND (title ILIKE '%перец%' OR title ILIKE '%перч%')` },
+      { slug: 'onions-garlic',
+        sql: `category = 'vegetables' AND (title ILIKE '%лук%' OR title ILIKE '%чеснок%' OR title ILIKE '%шалот%')` },
+      { slug: 'squash',
+        sql: `category = 'vegetables' AND (title ILIKE '%кабачок%' OR title ILIKE '%тыква%' OR title ILIKE '%баклажан%')` },
+      // Фрукты
+      { slug: 'pome-fruits',
+        sql: `category = 'fruits' AND (title ILIKE '%яблок%' OR title ILIKE '%груш%')` },
+      { slug: 'stone-fruits',
+        sql: `category = 'fruits' AND (title ILIKE '%персик%' OR title ILIKE '%нектарин%' OR title ILIKE '%слив%' OR title ILIKE '%абрикос%')` },
+      { slug: 'berries-grapes',
+        sql: `category = 'fruits' AND (title ILIKE '%черешн%' OR title ILIKE '%вишн%' OR title ILIKE '%клубник%' OR title ILIKE '%виноград%')` },
+      { slug: 'melons',
+        sql: `category = 'fruits' AND (title ILIKE '%арбуз%' OR title ILIKE '%дын%')` },
+      { slug: 'exotic',
+        sql: `category = 'fruits' AND (title ILIKE '%манго%' OR title ILIKE '%киви%' OR title ILIKE '%гранат%' OR title ILIKE '%хурм%' OR title ILIKE '%инжир%' OR title ILIKE '%авокадо%' OR title ILIKE '%папай%' OR title ILIKE '%маракуй%' OR title ILIKE '%ананас%')` },
+      { slug: 'citrus',
+        sql: `category = 'fruits' AND (title ILIKE '%лимон%' OR title ILIKE '%апельсин%' OR title ILIKE '%мандарин%')` },
+      // Зелень
+      { slug: 'fresh-herbs',
+        sql: `category = 'greens' AND (title ILIKE '%петрушк%' OR title ILIKE '%укроп%' OR title ILIKE '%кинза%' OR title ILIKE '%лук зелён%' OR title ILIKE '%шнитт%' OR title ILIKE '%черемш%')` },
+      { slug: 'salads',
+        sql: `category = 'greens' AND (title ILIKE '%салат%' OR title ILIKE '%рукол%' OR title ILIKE '%шпинат%' OR title ILIKE '%мангольд%' OR title ILIKE '%щавел%' OR title ILIKE '%кресс%')` },
+      { slug: 'spice-herbs',
+        sql: `category = 'greens' AND (title ILIKE '%базилик%' OR title ILIKE '%мята%' OR title ILIKE '%тархун%' OR title ILIKE '%розмарин%' OR title ILIKE '%тимьян%')` },
+    ];
+
+    const counts = {};
+    for (const { slug, sql } of assignments) {
+      const r = await query(
+        `UPDATE products SET subcategory_id = $1 WHERE ${sql} AND subcategory_id IS NULL`,
+        [sc[slug]]
+      );
+      counts[slug] = r.rowCount;
+    }
+
+    // "Прочие" — всё без подкатегории в соответствующей категории
+    const vegOther = await query(
+      `UPDATE products SET subcategory_id = $1
+       WHERE category = 'vegetables' AND subcategory_id IS NULL`,
+      [sc['other-vegetables']]
+    );
+    counts['other-vegetables'] = vegOther.rowCount;
+
+    const greenOther = await query(
+      `UPDATE products SET subcategory_id = $1
+       WHERE category = 'greens' AND subcategory_id IS NULL`,
+      [sc['other-greens']]
+    );
+    counts['other-greens'] = greenOther.rowCount;
+
+    // Итого
+    const { rows: assigned } = await query(
+      `SELECT COUNT(*) AS n FROM products WHERE subcategory_id IS NOT NULL`
+    );
+    const { rows: total } = await query(
+      `SELECT COUNT(*) AS n FROM products WHERE category IN ('vegetables','fruits','greens')`
+    );
+
+    res.json({
+      ok: true,
+      subcategoriesCreated: subcatDefs.length,
+      productsAssigned: parseInt(assigned[0].n),
+      productsTotal: parseInt(total[0].n),
+      breakdown: counts,
+    });
+  } catch (e) {
+    console.error('/api/migrate-subcategories error:', e);
+    res.status(500).json({ error: e.message });
   }
 });
 
