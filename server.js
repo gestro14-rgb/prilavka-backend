@@ -322,9 +322,13 @@ app.get('/api/districts', async (req, res) => {
 // Весь каталог (категории + товары + отзывы + доставки) — то, что раньше было в products.js
 app.get('/api/catalog', async (req, res) => {
   try {
-    const [categoriesRes, productsRes, reviewsRes, deliveriesRes, compositionsRes] = await Promise.all([
+    const [categoriesRes, subcatsRes, productsRes, reviewsRes, deliveriesRes, compositionsRes] = await Promise.all([
       query('SELECT * FROM categories ORDER BY sort_order ASC'),
-      query('SELECT * FROM products WHERE is_active = true ORDER BY sort_order ASC, created_at ASC'),
+      query('SELECT * FROM subcategories ORDER BY category_id, sort_order ASC'),
+      query(`SELECT p.* FROM products p
+             LEFT JOIN subcategories sc ON p.subcategory_id = sc.id
+             WHERE p.is_active = true
+             ORDER BY sc.sort_order ASC NULLS LAST, p.title ASC`),
       query("SELECT * FROM reviews WHERE status = 'published' ORDER BY sort_order ASC"),
       query('SELECT * FROM deliveries ORDER BY sort_order ASC'),
       query('SELECT * FROM набор_состав ORDER BY product_id, sort_order'),
@@ -338,6 +342,13 @@ app.get('/api/catalog', async (req, res) => {
 
     res.json({
       categories: [{ id: 'all', label: 'Все' }, ...categoriesRes.rows.map((c) => ({ id: c.id, label: c.label }))],
+      subcategories: subcatsRes.rows.map((sc) => ({
+        id: sc.id,
+        category_id: sc.category_id,
+        name: sc.name,
+        slug: sc.slug,
+        sort_order: sc.sort_order,
+      })),
       products: productsRes.rows.map((row) => ({
         ...toProductDTO(row),
         bundleComposition: compositionsByProduct[row.id] ?? null,
