@@ -1394,6 +1394,82 @@ app.delete('/api/admin/categories/:id', requireAuth, async (req, res) => {
 });
 
 // ============================================================
+// Админские маршруты — подкатегории
+// ============================================================
+
+app.get('/api/admin/subcategories', requireAuth, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM subcategories ORDER BY category_id, sort_order ASC');
+    res.json(result.rows.map((sc) => ({
+      id: sc.id,
+      name: sc.name,
+      categoryId: sc.category_id,
+      slug: sc.slug,
+      sortOrder: sc.sort_order,
+    })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.post('/api/admin/subcategories', requireAuth, async (req, res) => {
+  const { name, categoryId, sortOrder } = req.body || {};
+  if (!name || !String(name).trim() || !categoryId) {
+    return res.status(400).json({ error: 'Укажите name и categoryId' });
+  }
+  try {
+    const slug = String(name).trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-zа-яё0-9-]/gi, '');
+    const result = await query(
+      'INSERT INTO subcategories (name, category_id, slug, sort_order) VALUES ($1, $2, $3, $4) RETURNING *',
+      [String(name).trim(), categoryId, slug, Number(sortOrder) || 0]
+    );
+    const sc = result.rows[0];
+    res.status(201).json({ id: sc.id, name: sc.name, categoryId: sc.category_id, slug: sc.slug, sortOrder: sc.sort_order });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.put('/api/admin/subcategories/:id', requireAuth, async (req, res) => {
+  const { name, sortOrder } = req.body || {};
+  try {
+    const existing = await query('SELECT * FROM subcategories WHERE id = $1', [req.params.id]);
+    if (!existing.rows[0]) return res.status(404).json({ error: 'Подкатегория не найдена' });
+    const cur = existing.rows[0];
+    const newName = name !== undefined ? String(name).trim() : cur.name;
+    const newSlug = name !== undefined
+      ? newName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-zа-яё0-9-]/gi, '')
+      : cur.slug;
+    const result = await query(
+      'UPDATE subcategories SET name = $1, slug = $2, sort_order = $3, updated_at = now() WHERE id = $4 RETURNING *',
+      [newName, newSlug, sortOrder !== undefined ? Number(sortOrder) : cur.sort_order, req.params.id]
+    );
+    const sc = result.rows[0];
+    res.json({ id: sc.id, name: sc.name, categoryId: sc.category_id, slug: sc.slug, sortOrder: sc.sort_order });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.delete('/api/admin/subcategories/:id', requireAuth, async (req, res) => {
+  try {
+    const productsRes = await query('SELECT COUNT(*)::int AS count FROM products WHERE subcategory_id = $1', [req.params.id]);
+    if ((productsRes.rows[0]?.count || 0) > 0) {
+      return res.status(409).json({ error: 'Нельзя удалить подкатегорию: в ней есть товары' });
+    }
+    const result = await query('DELETE FROM subcategories WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Подкатегория не найдена' });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
 // Админские маршруты — районы доставки
 // ============================================================
 
