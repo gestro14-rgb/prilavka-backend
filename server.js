@@ -1158,8 +1158,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
   try {
     await query(
       `INSERT INTO products
-        (id, title, price, weight, emoji, bg, category, badge_type, badge_label, composition, suppliers, pricing, is_active, sort_order, image_url, is_bundle)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+        (id, title, price, weight, emoji, bg, category, badge_type, badge_label, composition, suppliers, pricing, is_active, sort_order, image_url, is_bundle, subcategory_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
       [
         p.id,
         p.title,
@@ -1177,6 +1177,7 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
         p.sortOrder || 0,
         p.imageUrl || null,
         p.isBundle === true,
+        p.subcategoryId || null,
       ]
     );
     const result = await query('SELECT * FROM products WHERE id = $1', [p.id]);
@@ -1215,8 +1216,9 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         sort_order = $13,
         image_url = $14,
         is_bundle = $15,
+        subcategory_id = $16,
         updated_at = now()
-       WHERE id = $16`,
+       WHERE id = $17`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -1233,6 +1235,7 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         p.sortOrder ?? cur.sort_order,
         p.imageUrl !== undefined ? (p.imageUrl || null) : (cur.image_url || null),
         p.isBundle !== undefined ? p.isBundle === true : cur.is_bundle,
+        p.subcategoryId !== undefined ? (p.subcategoryId || null) : (cur.subcategory_id || null),
         req.params.id,
       ]
     );
