@@ -326,31 +326,6 @@ app.get('/api/districts', async (req, res) => {
   }
 });
 
-// ВРЕМЕННО: одноразовая миграция 013 (орфография «ё» в названиях районов).
-// Удалить сразу после успешного вызова.
-app.get('/api/migrate-district-spelling', async (req, res) => {
-  if (req.query.token !== 'fix-dist-2026') {
-    return res.status(403).json({ error: 'forbidden' });
-  }
-  try {
-    const stmts = [
-      ['districts:Тёплый Стан', "UPDATE districts SET name = 'Тёплый Стан' WHERE name = 'Теплый Стан'"],
-      ['districts:Тропарёво',   "UPDATE districts SET name = 'Тропарёво' WHERE name = 'Тропарево'"],
-      ['reviews:Тёплый Стан',   "UPDATE reviews SET area = 'Тёплый Стан' WHERE area = 'Теплый Стан'"],
-      ['reviews:Тропарёво',     "UPDATE reviews SET area = 'Тропарёво' WHERE area = 'Тропарево'"],
-    ];
-    const updated = {};
-    for (const [label, sql] of stmts) {
-      const r = await query(sql);
-      updated[label] = r.rowCount;
-    }
-    res.json({ ok: true, updated });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
 
 // Весь каталог
 
