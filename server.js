@@ -218,29 +218,39 @@ function sendTelegramMessage(text) {
   return sendTelegramMessageToChat(TELEGRAM_ADMIN_CHAT_ID, text);
 }
 
+const fmtOrderId = (id) => '#' + String(id).padStart(4, '0');
+
 const ORDER_STATUS_NOTIFICATIONS = {
-  in_progress: (id) => `🥗 Ваш заказ #${id} готовится!`,
+  in_progress: (id) => `🥗 Ваш заказ ${fmtOrderId(id)} готовится!`,
   courier:     (id) => `🛵 Курьер уже едет к вам! Ожидайте в ближайшее время.`,
-  delivered:   (id) => `✅ Заказ #${id} доставлен. Спасибо!`,
-  cancelled:   (id) => `❌ Заказ #${id} отменён. Свяжитесь с нами если вопросы.`,
+  delivered:   (id) => `✅ Заказ ${fmtOrderId(id)} доставлен. Спасибо!`,
+  cancelled:   (id) => `❌ Заказ ${fmtOrderId(id)} отменён. Свяжитесь с нами если вопросы.`,
 };
 
 // Формирует читаемое текстовое сообщение о новом заказе для уведомления в Telegram.
 function formatOrderNotification(order) {
   const lines = [];
-  lines.push(`🧺 <b>Новый заказ ${'#' + order.id}</b>`);
+  lines.push(`🧺 <b>Новый заказ ${'#' + String(order.id).padStart(4, '0')}</b>`);
   lines.push('');
 
+  let subtotal = 0;
   if (Array.isArray(order.items)) {
     for (const item of order.items) {
-      lines.push(`• ${item.title} × ${item.qty} — ${item.sum?.toLocaleString('ru-RU')} ₽`);
+      subtotal += Number(item.sum) || 0;
+      lines.push(`• ${item.title} × ${item.qty} — ${(Number(item.sum) || 0).toLocaleString('ru-RU')} ₽`);
     }
   }
   lines.push('');
-  lines.push(`<b>Итого: ${Number(order.total).toLocaleString('ru-RU')} ₽</b>`);
-  if (order.promo_code && order.discount_amount) {
-    lines.push(`🎁 Промокод ${order.promo_code} (−${Number(order.discount_amount).toLocaleString('ru-RU')} ₽)`);
+
+  // Разбивка сходится: товары − скидка = итог. Строку скидки показываем для
+  // любой скидки (промокод / баллы / реферал), а не только промокода.
+  const discount = Number(order.discount_amount) || 0;
+  if (discount > 0) {
+    lines.push(`Товары: ${subtotal.toLocaleString('ru-RU')} ₽`);
+    const discountLabel = order.promo_code ? `Скидка (промокод ${order.promo_code})` : 'Скидка';
+    lines.push(`${discountLabel}: −${discount.toLocaleString('ru-RU')} ₽`);
   }
+  lines.push(`<b>Итого: ${Number(order.total).toLocaleString('ru-RU')} ₽</b>`);
   lines.push('');
 
   if (order.delivery_date || order.delivery_slot) {
