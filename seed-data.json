@@ -62,16 +62,14 @@
       ],
       "suppliers": [
         {
-          "emoji": "👨",
-          "name": "Сергей Иванов",
-          "region": "Краснодарский край",
-          "note": "свекла, морковь, картофель"
+          "category": "vegetables",
+          "categoryLabel": "Овощи для борща",
+          "region": "Краснодарский край"
         },
         {
-          "emoji": "👩",
-          "name": "Елена Петрова",
-          "region": "Ставропольский край",
-          "note": "капуста, зелень, лук"
+          "category": "greens",
+          "categoryLabel": "Зелень и капуста",
+          "region": "Ставропольский край"
         }
       ],
       "pricing": [
@@ -153,22 +151,19 @@
       ],
       "suppliers": [
         {
-          "emoji": "👨",
-          "name": "Сергей Иванов",
-          "region": "Краснодарский край",
-          "note": "овощи, помидоры, огурцы"
+          "category": "vegetables",
+          "categoryLabel": "Овощи и томаты",
+          "region": "Краснодарский край"
         },
         {
-          "emoji": "👩",
-          "name": "Елена Петрова",
-          "region": "Ставропольский край",
-          "note": "зелень, лук, капуста"
+          "category": "greens",
+          "categoryLabel": "Зелень и лук",
+          "region": "Ставропольский край"
         },
         {
-          "emoji": "👴",
-          "name": "Иван Сидоров",
-          "region": "Крым",
-          "note": "яблоки"
+          "category": "fruits",
+          "categoryLabel": "Яблоки и фрукты",
+          "region": "Крым"
         }
       ],
       "pricing": [
@@ -242,10 +237,9 @@
       ],
       "suppliers": [
         {
-          "emoji": "🚢",
-          "name": "Партнер-импортер",
-          "region": "Вьетнам, Эквадор",
-          "note": "тропические фрукты, отбор вручную"
+          "category": "fruits",
+          "categoryLabel": "Тропические фрукты",
+          "region": "Вьетнам, Эквадор"
         }
       ],
       "pricing": [
@@ -295,10 +289,9 @@
       ],
       "suppliers": [
         {
-          "emoji": "👨",
-          "name": "Сергей Иванов",
-          "region": "Краснодарский край",
-          "note": "выращивает овощи более 12 лет"
+          "category": "vegetables",
+          "categoryLabel": "Овощи и томаты",
+          "region": "Краснодарский край"
         }
       ],
       "pricing": [
@@ -348,10 +341,9 @@
       ],
       "suppliers": [
         {
-          "emoji": "👨",
-          "name": "Сергей Иванов",
-          "region": "Краснодарский край",
-          "note": "собрано вчера"
+          "category": "vegetables",
+          "categoryLabel": "Овощи и морковь",
+          "region": "Краснодарский край"
         }
       ],
       "pricing": [
@@ -409,10 +401,9 @@
       ],
       "suppliers": [
         {
-          "emoji": "👩",
-          "name": "Елена Петрова",
-          "region": "Ставропольский край",
-          "note": "зелень, салаты"
+          "category": "greens",
+          "categoryLabel": "Зелень и салаты",
+          "region": "Ставропольский край"
         }
       ],
       "pricing": [
@@ -466,10 +457,9 @@
       ],
       "suppliers": [
         {
-          "emoji": "👴",
-          "name": "Иван Сидоров",
-          "region": "Крым",
-          "note": "яблоки, груши"
+          "category": "fruits",
+          "categoryLabel": "Фрукты и груши",
+          "region": "Крым"
         }
       ],
       "pricing": [
@@ -519,10 +509,9 @@
       ],
       "suppliers": [
         {
-          "emoji": "👨",
-          "name": "Сергей Иванов",
-          "region": "Краснодарский край",
-          "note": "собрано вчера"
+          "category": "vegetables",
+          "categoryLabel": "Овощи и картофель",
+          "region": "Краснодарский край"
         }
       ],
       "pricing": [
