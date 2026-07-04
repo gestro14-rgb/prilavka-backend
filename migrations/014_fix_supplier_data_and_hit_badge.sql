@@ -40,5 +40,5 @@ UPDATE products SET suppliers = '[
 
 -- Бейдж "Хит недели": borsch получает его, exotic его теряет (без замены
 -- на другую непроверенную метку).
-UPDATE products SET badge_type = 'hit', badge_label = 'Хит' WHERE id = 'borsch';
+UPDATE products SET badge_type = 'hit', badge_label = 'Чаще берут' WHERE id = 'borsch';
 UPDATE products SET badge_type = NULL, badge_label = NULL WHERE id = 'exotic';
