@@ -16,6 +16,8 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const YANDEX_GEOCODER_API_KEY = process.env.YANDEX_GEOCODER_API_KEY || '';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID || '';
+// Публичный URL мини-приложения — для web_app-кнопки в пуше "оставьте отзыв".
+const MINI_APP_URL = process.env.MINI_APP_URL || 'https://prilavka-app-production.up.railway.app';
 
 const REFERRAL_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const REFERRAL_CODE_LENGTH = 6;
@@ -43,6 +45,7 @@ let settingsCache = {
   referral_discount:        '200',
   max_points_spend_percent: '30',
   default_slot:             '18:00–21:00',
+  review_photo_points:      '100',
 };
 
 async function loadSettings() {
@@ -59,9 +62,6 @@ async function loadSettings() {
 function getSetting(key) {
   return settingsCache[key];
 }
-
-// Состояние диалога отзыва с ботом: telegramId (string) → { step, rating, text, firstName }
-const reviewDialogs = new Map();
 
 // ============================================================
 // Вспомогательные функции
@@ -745,10 +745,12 @@ app.get('/api/orders/:id', async (req, res) => {
 
   try {
     const result = await query(
-      `SELECT id, status, items, total, discount_amount, delivery_date, delivery_slot,
-              address_street, address_details, phone, comment, payment_method, leave_at_door,
-              created_at, telegram_user_id
-       FROM orders WHERE id = $1`,
+      `SELECT o.id, o.status, o.items, o.total, o.discount_amount, o.delivery_date, o.delivery_slot,
+              o.address_street, o.address_details, o.phone, o.comment, o.payment_method, o.leave_at_door,
+              o.created_at, o.telegram_user_id, (r.id IS NOT NULL) AS has_review
+       FROM orders o
+       LEFT JOIN reviews r ON r.order_id = o.id
+       WHERE o.id = $1`,
       [orderId]
     );
     const order = result.rows[0];
@@ -773,6 +775,7 @@ app.get('/api/orders/:id', async (req, res) => {
       leaveAtDoor: order.leave_at_door || false,
       paymentMethod: order.payment_method,
       createdAt: order.created_at,
+      hasReview: order.has_review,
     });
   } catch (e) {
     console.error(e);
@@ -783,50 +786,108 @@ app.get('/api/orders/:id', async (req, res) => {
 // Пресет эмодзи для отзывов от клиентов (назначается случайно)
 const REVIEW_EMOJIS = ['😊', '🌿', '🥕', '🧺', '👍'];
 
-// Проверяет, может ли пользователь оставить отзыв:
-// есть хотя бы один доставленный заказ и ещё нет отзыва от этого пользователя.
-app.get('/api/users/:telegramId/review-eligibility', async (req, res) => {
-  const { telegramId } = req.params;
-  if (!telegramId || telegramId === '0') return res.json({ canReview: false });
+// Загрузка фото отзыва (публично, без admin-авторизации — отзывы оставляют
+// обычные покупатели). Тот же multer + Cloudinary, что и у админского
+// /api/admin/upload-image, просто без requireAuth и в отдельной папке.
+app.post('/api/reviews/upload-photo', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Файл не получен' });
+  const stream = cloudinary.uploader.upload_stream(
+    { folder: 'prilavka/reviews', resource_type: 'image' },
+    (error, result) => {
+      if (error) {
+        console.error('Cloudinary upload error:', error);
+        return res.status(500).json({ error: 'Ошибка загрузки на Cloudinary' });
+      }
+      res.json({ url: result.secure_url });
+    },
+  );
+  stream.end(req.file.buffer);
+});
+
+// Отправка отзыва по конкретному заказу (экран 7b). Один отзыв на заказ —
+// повторная попытка получит 409 (см. уникальный индекс idx_reviews_order_id).
+// Все отзывы создаются со status='pending' (публикуются только после
+// модерации в админке — see /api/catalog: WHERE status = 'published').
+app.post('/api/orders/:id/review', async (req, res) => {
+  const orderId = parseInt(req.params.id, 10);
+  const { telegramUserId, firstName, area, stars, tags, text, photoUrl } = req.body || {};
+  const starsNum = Math.min(5, Math.max(1, Number(stars) || 0));
+  if (!telegramUserId || isNaN(orderId) || !starsNum) {
+    return res.status(400).json({ error: 'Укажите telegramUserId, orderId и stars' });
+  }
   try {
-    const [ordersRes, reviewRes] = await Promise.all([
-      query("SELECT 1 FROM orders WHERE telegram_user_id = $1 AND status = 'delivered' LIMIT 1", [telegramId]),
-      query('SELECT 1 FROM reviews WHERE telegram_user_id = $1 LIMIT 1', [telegramId]),
-    ]);
-    const canReview = ordersRes.rows.length > 0 && reviewRes.rows.length === 0;
-    res.json({ canReview });
+    const orderRes = await query(
+      "SELECT id, telegram_user_id, status FROM orders WHERE id = $1",
+      [orderId]
+    );
+    const order = orderRes.rows[0];
+    if (!order) return res.status(404).json({ error: 'Заказ не найден' });
+    if (String(order.telegram_user_id) !== String(telegramUserId)) {
+      return res.status(403).json({ error: 'Нет доступа к этому заказу' });
+    }
+    if (order.status !== 'delivered') {
+      return res.status(400).json({ error: 'Отзыв можно оставить только для доставленного заказа' });
+    }
+
+    const emoji = REVIEW_EMOJIS[Math.floor(Math.random() * REVIEW_EMOJIS.length)];
+    let review;
+    try {
+      const insertRes = await query(
+        `INSERT INTO reviews (name, area, stars, text, emoji, status, telegram_user_id, order_id, tags, image_url)
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $9)
+         RETURNING *`,
+        [
+          (firstName || 'Клиент').trim(),
+          (area || '').trim() || 'Москва',
+          starsNum,
+          (text || '').trim() || null,
+          emoji,
+          telegramUserId,
+          orderId,
+          JSON.stringify(Array.isArray(tags) ? tags : []),
+          photoUrl || null,
+        ]
+      );
+      review = insertRes.rows[0];
+    } catch (e) {
+      if (e.code === '23505') return res.status(409).json({ error: 'Вы уже оставляли отзыв по этому заказу' });
+      throw e;
+    }
+
+    // +N баллов — только за отзыв с фото (см. миграцию 017).
+    let pointsAwarded = 0;
+    if (photoUrl) {
+      pointsAwarded = Number(getSetting('review_photo_points')) || 0;
+      if (pointsAwarded > 0) {
+        await query(
+          'UPDATE users SET points = points + $1, updated_at = now() WHERE telegram_id = $2',
+          [pointsAwarded, telegramUserId]
+        );
+      }
+    }
+
+    res.status(201).json({ id: review.id, pointsAwarded });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
 
-// Публичный эндпоинт: клиент отправляет отзыв из мини-приложения.
-// Создаёт запись со status = 'pending' — отзыв не показывается до публикации в админке.
-app.post('/api/reviews', async (req, res) => {
-  const { telegramUserId, firstName, area, stars, text } = req.body || {};
-  if (!telegramUserId || !text || !text.trim()) {
-    return res.status(400).json({ error: 'Укажите telegramUserId и text' });
+// "Позже" на баннере/пуше отзыва — не предлагать повторно в тот же день для этого заказа.
+app.post('/api/orders/:id/review-dismiss', async (req, res) => {
+  const orderId = parseInt(req.params.id, 10);
+  const { telegramUserId } = req.body || {};
+  if (!telegramUserId || isNaN(orderId)) {
+    return res.status(400).json({ error: 'Укажите telegramUserId' });
   }
   try {
-    const existingRes = await query('SELECT 1 FROM reviews WHERE telegram_user_id = $1', [telegramUserId]);
-    if (existingRes.rows.length > 0) {
-      return res.status(409).json({ error: 'Вы уже оставляли отзыв' });
-    }
-    const emoji = REVIEW_EMOJIS[Math.floor(Math.random() * REVIEW_EMOJIS.length)];
-    await query(
-      `INSERT INTO reviews (name, area, stars, text, emoji, status, telegram_user_id)
-       VALUES ($1, $2, $3, $4, $5, 'pending', $6)`,
-      [
-        (firstName || 'Клиент').trim(),
-        (area || '').trim() || 'Москва',
-        Math.min(5, Math.max(1, Number(stars) || 5)),
-        text.trim(),
-        emoji,
-        telegramUserId,
-      ]
+    const result = await query(
+      `UPDATE orders SET review_dismissed_at = now()
+       WHERE id = $1 AND telegram_user_id = $2 RETURNING id`,
+      [orderId, telegramUserId]
     );
-    res.status(201).json({ ok: true });
+    if (!result.rows[0]) return res.status(404).json({ error: 'Заказ не найден' });
+    res.json({ ok: true });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
@@ -915,15 +976,19 @@ app.get('/api/users/:telegramId/stats', async (req, res) => {
 });
 
 // Последние 10 заказов пользователя по telegram_user_id — для истории в профиле.
+// hasReview/reviewDismissedAt — чтобы главная и профиль сами решали, показывать
+// ли баннер/пуш "оставьте отзыв" для конкретного заказа (без отдельного запроса).
 app.get('/api/users/:telegramId/orders', async (req, res) => {
   const { telegramId } = req.params;
   if (!telegramId || telegramId === '0') return res.json([]);
   try {
     const result = await query(
-      `SELECT id, total, status, created_at, items, delivery_date, delivery_slot
-       FROM orders
-       WHERE telegram_user_id = $1
-       ORDER BY created_at DESC
+      `SELECT o.id, o.total, o.status, o.created_at, o.items, o.delivery_date, o.delivery_slot,
+              o.review_dismissed_at, (r.id IS NOT NULL) AS has_review
+       FROM orders o
+       LEFT JOIN reviews r ON r.order_id = o.id
+       WHERE o.telegram_user_id = $1
+       ORDER BY o.created_at DESC
        LIMIT 10`,
       [telegramId]
     );
@@ -935,6 +1000,8 @@ app.get('/api/users/:telegramId/orders', async (req, res) => {
       items: o.items,
       deliveryDate: o.delivery_date,
       deliverySlot: o.delivery_slot,
+      hasReview: o.has_review,
+      reviewDismissedAt: o.review_dismissed_at,
     })));
   } catch (e) {
     console.error(e);
@@ -1736,7 +1803,7 @@ app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
 
     // Приглашение оставить отзыв при переходе в "delivered" (fire-and-forget)
     if (status === 'delivered' && cur.status !== 'delivered' && o.telegram_user_id) {
-      sendReviewInvite(o.telegram_user_id, o.telegram_first_name).catch((e) =>
+      sendReviewInvite(o.telegram_user_id, o.id).catch((e) =>
         console.error('sendReviewInvite error:', e)
       );
     }
@@ -2304,148 +2371,23 @@ async function botRequest(method, body) {
   }
 }
 
-// Отправляет приглашение с inline-кнопками оценки.
-// Не отправляет если пользователь уже оставлял отзыв или диалог уже открыт.
-async function sendReviewInvite(telegramId, firstName) {
-  const uid = String(telegramId);
-  if (reviewDialogs.has(uid)) return;
-  const existing = await query('SELECT 1 FROM reviews WHERE telegram_user_id = $1 LIMIT 1', [telegramId]);
+// Отправляет пуш "оставьте отзыв" с кнопкой, открывающей экран отзыва прямо
+// в мини-приложении (web_app-кнопка — Bot API 6.1+, работает в любом чате
+// с ботом без регистрации домена в BotFather).
+// Не отправляет повторно, если отзыв на этот заказ уже есть.
+async function sendReviewInvite(telegramId, orderId) {
+  const existing = await query('SELECT 1 FROM reviews WHERE order_id = $1 LIMIT 1', [orderId]);
   if (existing.rows.length > 0) return;
 
   await botRequest('sendMessage', {
     chat_id: telegramId,
-    text: '🙏 Спасибо за заказ! Как вам доставка?',
+    text: `🙏 Спасибо за заказ ${fmtOrderId(orderId)}! Как вам доставка?`,
     reply_markup: {
       inline_keyboard: [[
-        { text: '1 ⭐', callback_data: 'review_rating:1' },
-        { text: '2 ⭐', callback_data: 'review_rating:2' },
-        { text: '3 ⭐', callback_data: 'review_rating:3' },
-        { text: '4 ⭐', callback_data: 'review_rating:4' },
-        { text: '5 ⭐', callback_data: 'review_rating:5' },
+        { text: 'Оценить заказ', web_app: { url: `${MINI_APP_URL}/review/${orderId}` } },
       ]],
     },
   });
-
-  reviewDialogs.set(uid, { step: 'rating', rating: null, text: null, firstName: firstName || 'Клиент' });
-}
-
-// Сохраняет отзыв в БД и благодарит пользователя.
-async function saveReview(uid, dialog, imageUrl) {
-  const emoji = REVIEW_EMOJIS[Math.floor(Math.random() * REVIEW_EMOJIS.length)];
-  await query(
-    `INSERT INTO reviews (name, area, stars, text, emoji, status, telegram_user_id, image_url)
-     VALUES ($1, 'Москва', $2, $3, $4, 'pending', $5, $6)`,
-    [
-      (dialog.firstName || 'Клиент').trim(),
-      dialog.rating || 5,
-      dialog.text || '—',
-      emoji,
-      uid,
-      imageUrl || null,
-    ]
-  );
-  await botRequest('sendMessage', {
-    chat_id: uid,
-    text: '🙏 Спасибо за отзыв! Он появится после проверки.',
-  });
-}
-
-// Обрабатывает одно входящее обновление от Telegram.
-async function handleBotUpdate(update) {
-  // Нажатие inline-кнопки оценки
-  if (update.callback_query) {
-    const cq = update.callback_query;
-    const uid = String(cq.from.id);
-    await botRequest('answerCallbackQuery', { callback_query_id: cq.id });
-
-    if (!cq.data?.startsWith('review_rating:')) return;
-    const dialog = reviewDialogs.get(uid);
-    if (!dialog || dialog.step !== 'rating') return;
-
-    const rating = parseInt(cq.data.split(':')[1], 10);
-    dialog.rating = rating;
-    dialog.step = 'text';
-    reviewDialogs.set(uid, dialog);
-
-    await botRequest('editMessageText', {
-      chat_id: cq.message.chat.id,
-      message_id: cq.message.message_id,
-      text: `Ваша оценка: ${'⭐'.repeat(rating)}`,
-    });
-    await botRequest('sendMessage', {
-      chat_id: uid,
-      text: 'Напишите пару слов о заказе, или /skip чтобы пропустить.',
-    });
-    return;
-  }
-
-  // Текстовое сообщение или фото
-  if (update.message) {
-    const msg = update.message;
-    const uid = String(msg.from?.id ?? msg.chat.id);
-    const dialog = reviewDialogs.get(uid);
-    if (!dialog) return;
-
-    if (dialog.step === 'text') {
-      const raw = (msg.text || '').trim();
-      dialog.text = raw === '/skip' ? null : raw || null;
-      dialog.step = 'photo';
-      reviewDialogs.set(uid, dialog);
-      await botRequest('sendMessage', {
-        chat_id: uid,
-        text: 'Пришлите фото заказа, или /skip чтобы завершить без фото.',
-      });
-      return;
-    }
-
-    if (dialog.step === 'photo') {
-      if (msg.photo?.length > 0) {
-        // Берём версию с наибольшим разрешением (последний элемент)
-        const fileId = msg.photo[msg.photo.length - 1].file_id;
-        const fileInfo = await botRequest('getFile', { file_id: fileId });
-        const imageUrl = fileInfo?.file_path
-          ? `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`
-          : null;
-        reviewDialogs.delete(uid);
-        await saveReview(uid, dialog, imageUrl);
-      } else if ((msg.text || '').trim() === '/skip') {
-        reviewDialogs.delete(uid);
-        await saveReview(uid, dialog, null);
-      } else {
-        await botRequest('sendMessage', {
-          chat_id: uid,
-          text: 'Пожалуйста, пришлите фото или отправьте /skip.',
-        });
-      }
-    }
-  }
-}
-
-// Long polling: запускается один раз после старта сервера.
-// getUpdates с timeout=25 — запрос висит до 25 секунд если нет событий,
-// event loop при этом не блокируется (await).
-async function startBotPolling() {
-  if (!TELEGRAM_BOT_TOKEN) return;
-  let offset = 0;
-  console.log('Telegram-бот запущен (long polling)');
-  for (;;) {
-    try {
-      const res = await fetch(
-        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates` +
-        `?timeout=25&offset=${offset}&allowed_updates=["message","callback_query"]`
-      );
-      const data = await res.json();
-      if (data.ok && data.result.length > 0) {
-        for (const update of data.result) {
-          handleBotUpdate(update).catch((e) => console.error('handleBotUpdate error:', e));
-          offset = update.update_id + 1;
-        }
-      }
-    } catch (e) {
-      console.error('Bot polling error:', e);
-      await new Promise((r) => setTimeout(r, 5000));
-    }
-  }
 }
 
 // ============================================================
@@ -2492,5 +2434,4 @@ loadSettings().catch((e) => console.error('loadSettings error:', e));
 
 app.listen(PORT, () => {
   console.log(`Прилавка API запущен на порту ${PORT}`);
-  startBotPolling();
 });
