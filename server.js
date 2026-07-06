@@ -101,6 +101,18 @@ function toBundleItemDTO(row) {
   };
 }
 
+function toReviewDTO(row) {
+  return {
+    name: row.name,
+    area: row.area,
+    stars: row.stars,
+    text: row.text,
+    emoji: row.emoji,
+    imageUrl: row.image_url || null,
+    avatarUrl: row.avatar_url || null,
+  };
+}
+
 // Middleware: проверка JWT-токена администратора
 function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
@@ -365,21 +377,33 @@ app.get('/api/catalog', async (req, res) => {
         ...toProductDTO(row),
         bundleComposition: compositionsByProduct[row.id] ?? null,
       })),
-      reviews: reviewsRes.rows.map((r) => ({
-        name: r.name,
-        area: r.area,
-        stars: r.stars,
-        text: r.text,
-        emoji: r.emoji,
-        imageUrl: r.image_url || null,
-        avatarUrl: r.avatar_url || null,
-      })),
+      reviews: reviewsRes.rows.map(toReviewDTO),
       deliveries: deliveriesRes.rows.map((d) => ({
         emoji: d.emoji,
         title: d.title,
         text: d.text,
       })),
     });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Полный список одобренных отзывов с пагинацией — для страницы /reviews
+// ("Все отзывы"). /api/catalog отдаёт их же, но без пагинации — там это
+// нормально, пока Home показывает только первые 4.
+app.get('/api/reviews', async (req, res) => {
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+  const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+  try {
+    // Берём на 1 больше лимита — если пришло больше, значит есть следующая страница.
+    const result = await query(
+      "SELECT * FROM reviews WHERE status = 'published' ORDER BY id DESC LIMIT $1 OFFSET $2",
+      [limit + 1, offset]
+    );
+    const hasMore = result.rows.length > limit;
+    res.json({ reviews: result.rows.slice(0, limit).map(toReviewDTO), hasMore });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
