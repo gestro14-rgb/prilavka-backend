@@ -339,7 +339,9 @@ app.get('/api/catalog', async (req, res) => {
              LEFT JOIN subcategories sc ON p.subcategory_id = sc.id
              WHERE p.is_active = true
              ORDER BY sc.sort_order ASC NULLS LAST, p.title ASC`),
-      query("SELECT * FROM reviews WHERE status = 'published' ORDER BY sort_order ASC"),
+      // Новые сверху. У reviews нет created_at — id (SERIAL) монотонно растёт
+      // с вставкой, так что id DESC надёжно даёт порядок "новые первые".
+      query("SELECT * FROM reviews WHERE status = 'published' ORDER BY id DESC"),
       query('SELECT * FROM deliveries ORDER BY sort_order ASC'),
       query('SELECT * FROM набор_состав ORDER BY product_id, sort_order'),
     ]);
