@@ -45,7 +45,7 @@ let settingsCache = {
   referral_discount:        '200',
   max_points_spend_percent: '30',
   default_slot:             '18:00–21:00',
-  review_photo_points:      '100',
+  review_photo_points:      '50',
 };
 
 async function loadSettings() {
