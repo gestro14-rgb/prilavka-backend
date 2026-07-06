@@ -372,6 +372,7 @@ app.get('/api/catalog', async (req, res) => {
         text: r.text,
         emoji: r.emoji,
         imageUrl: r.image_url || null,
+        avatarUrl: r.avatar_url || null,
       })),
       deliveries: deliveriesRes.rows.map((d) => ({
         emoji: d.emoji,
@@ -832,11 +833,12 @@ app.post('/api/orders/:id/review', async (req, res) => {
     }
 
     const emoji = REVIEW_EMOJIS[Math.floor(Math.random() * REVIEW_EMOJIS.length)];
+    const avatarUrl = await getTelegramAvatarUrl(telegramUserId);
     let review;
     try {
       const insertRes = await query(
-        `INSERT INTO reviews (name, area, stars, text, emoji, status, telegram_user_id, order_id, tags, image_url)
-         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $9)
+        `INSERT INTO reviews (name, area, stars, text, emoji, status, telegram_user_id, order_id, tags, image_url, avatar_url)
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $9, $10)
          RETURNING *`,
         [
           (firstName || 'Клиент').trim(),
@@ -848,6 +850,7 @@ app.post('/api/orders/:id/review', async (req, res) => {
           orderId,
           JSON.stringify(Array.isArray(tags) ? tags : []),
           photoUrl || null,
+          avatarUrl,
         ]
       );
       review = insertRes.rows[0];
@@ -2369,6 +2372,24 @@ async function botRequest(method, body) {
     return data.ok ? data.result : null;
   } catch (e) {
     console.error(`botRequest ${method} error:`, e);
+    return null;
+  }
+}
+
+// Пытается получить URL аватарки пользователя из Telegram (для карточки
+// отзыва на главной). Берём самый маленький доступный размер фото — для
+// круглого аватара 26px незачем тянуть 640x640. Best-effort: null при любой
+// ошибке (нет фото, бот не может достучаться и т.д.) — тогда карточка
+// покажет заглушку с инициалом.
+async function getTelegramAvatarUrl(telegramUserId) {
+  try {
+    const photos = await botRequest('getUserProfilePhotos', { user_id: telegramUserId, limit: 1 });
+    const fileId = photos?.photos?.[0]?.[0]?.file_id;
+    if (!fileId) return null;
+    const file = await botRequest('getFile', { file_id: fileId });
+    return file?.file_path ? `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}` : null;
+  } catch (e) {
+    console.error('getTelegramAvatarUrl error:', e);
     return null;
   }
 }
