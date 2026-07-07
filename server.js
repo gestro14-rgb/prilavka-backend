@@ -969,6 +969,7 @@ app.get('/api/users/:telegramId/stats', async (req, res) => {
       referralCode: null,
       points: 0,
       referralsCount: 0,
+      referralPointsReward: Number(getSetting('referral_points_reward')),
     });
   }
 
@@ -997,6 +998,7 @@ app.get('/api/users/:telegramId/stats', async (req, res) => {
       referralCode: userRecord.referral_code,
       points: userRecord.points,
       referralsCount: referralsRes.rows[0]?.count || 0,
+      referralPointsReward: Number(getSetting('referral_points_reward')),
     });
   } catch (e) {
     console.error(e);
