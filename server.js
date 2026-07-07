@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 import 'dotenv/config';
 import { pool, query } from './db.js';
 import { v2 as cloudinary } from 'cloudinary';
@@ -18,6 +19,11 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID || '';
 // Публичный URL мини-приложения — для web_app-кнопки в пуше "оставьте отзыв".
 const MINI_APP_URL = process.env.MINI_APP_URL || 'https://prilavka-app-production.up.railway.app';
+// Публичный URL этого API — куда Telegram будет слать апдейты вебхуком.
+const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || 'https://prilavka-backend-production.up.railway.app';
+// Секрет вебхука — генерируется при каждом старте и тут же регистрируется в
+// setWebhook, поэтому не нужно хранить его отдельно между рестартами.
+const TELEGRAM_WEBHOOK_SECRET = crypto.randomBytes(32).toString('hex');
 
 const REFERRAL_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const REFERRAL_CODE_LENGTH = 6;
@@ -2440,6 +2446,62 @@ async function sendReviewInvite(telegramId, orderId) {
 }
 
 // ============================================================
+// Telegram-бот: вебхук для /start
+// ============================================================
+
+const START_MESSAGE = `Привет! 👋 Я Михаил, делаю доставку свежих овощей и фруктов на юго-запад Москвы.
+
+Работаю со своими проверенными поставщиками, лично отбираю лучшее, привожу вечером с 18:00 до 21:00.
+
+💳 Оплата при получении — никакой предоплаты
+🌿 Показываю честно, куда уходит каждый рубль
+📍 Работаю по вашему району
+
+Жмите кнопку ниже, чтобы посмотреть каталог 👇`;
+
+// Принимает апдейты от Telegram (сейчас только текстовые сообщения — см.
+// allowed_updates в registerWebhook). Проверяем секрет, чтобы левые POST-запросы
+// не могли слать сообщения от имени бота случайным chat_id.
+app.post('/telegram-webhook', async (req, res) => {
+  if (req.get('X-Telegram-Bot-Api-Secret-Token') !== TELEGRAM_WEBHOOK_SECRET) {
+    return res.sendStatus(401);
+  }
+  res.sendStatus(200); // отвечаем сразу — Telegram ждёт быстрый 200
+
+  const msg = req.body?.message;
+  if (!msg?.text) return;
+
+  // /start (в том числе с реферальным диплинком "/start ref_XXXXX")
+  if (msg.text === '/start' || msg.text.startsWith('/start ')) {
+    await botRequest('sendMessage', {
+      chat_id: msg.chat.id,
+      text: START_MESSAGE,
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '🛒 Открыть Прилавку', web_app: { url: MINI_APP_URL } },
+        ]],
+      },
+    });
+  }
+});
+
+// Регистрирует вебхук при каждом старте сервера — идемпотентно, безопасно
+// вызывать повторно (Telegram просто обновит URL/секрет на тот же).
+async function registerWebhook() {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  const result = await botRequest('setWebhook', {
+    url: `${BACKEND_PUBLIC_URL}/telegram-webhook`,
+    secret_token: TELEGRAM_WEBHOOK_SECRET,
+    allowed_updates: ['message'],
+  });
+  if (result === null) {
+    console.error('Не удалось зарегистрировать Telegram-вебхук');
+  } else {
+    console.log('Telegram-вебхук зарегистрирован:', `${BACKEND_PUBLIC_URL}/telegram-webhook`);
+  }
+}
+
+// ============================================================
 // Админские маршруты — настройки
 // ============================================================
 
@@ -2480,6 +2542,7 @@ app.put('/api/admin/settings/:key', requireAuth, async (req, res) => {
 // ============================================================
 
 loadSettings().catch((e) => console.error('loadSettings error:', e));
+registerWebhook().catch((e) => console.error('registerWebhook error:', e));
 
 app.listen(PORT, () => {
   console.log(`Прилавка API запущен на порту ${PORT}`);
