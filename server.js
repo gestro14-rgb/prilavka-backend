@@ -115,7 +115,9 @@ function toReviewDTO(row) {
     text: row.text,
     emoji: row.emoji,
     imageUrl: row.image_url || null,
-    avatarUrl: row.avatar_url || null,
+    // avatar_url хранит только Telegram file_id (не протухает, не содержит
+    // токена) — резолвится в реальную картинку через прокси-эндпоинт ниже.
+    avatarUrl: row.avatar_url ? `${BACKEND_PUBLIC_URL}/api/avatar/${row.avatar_url}` : null,
   };
 }
 
@@ -863,7 +865,7 @@ app.post('/api/orders/:id/review', async (req, res) => {
     }
 
     const emoji = REVIEW_EMOJIS[Math.floor(Math.random() * REVIEW_EMOJIS.length)];
-    const avatarUrl = await getTelegramAvatarUrl(telegramUserId);
+    const avatarFileId = await getTelegramAvatarFileId(telegramUserId);
     let review;
     try {
       const insertRes = await query(
@@ -880,7 +882,7 @@ app.post('/api/orders/:id/review', async (req, res) => {
           orderId,
           JSON.stringify(Array.isArray(tags) ? tags : []),
           photoUrl || null,
-          avatarUrl,
+          avatarFileId,
         ]
       );
       review = insertRes.rows[0];
@@ -2408,23 +2410,42 @@ async function botRequest(method, body) {
   }
 }
 
-// Пытается получить URL аватарки пользователя из Telegram (для карточки
+// Пытается получить file_id аватарки пользователя из Telegram (для карточки
 // отзыва на главной). Берём самый маленький доступный размер фото — для
-// круглого аватара 26px незачем тянуть 640x640. Best-effort: null при любой
-// ошибке (нет фото, бот не может достучаться и т.д.) — тогда карточка
-// покажет заглушку с инициалом.
-async function getTelegramAvatarUrl(telegramUserId) {
+// круглого аватара 26px незачем тянуть 640x640. Храним именно file_id (не
+// протухает и не содержит токена бота) — в реальную картинку резолвится на
+// лету через /api/avatar/:fileId. Best-effort: null при любой ошибке (нет
+// фото, бот не может достучаться и т.д.) — тогда карточка покажет заглушку
+// с инициалом.
+async function getTelegramAvatarFileId(telegramUserId) {
   try {
     const photos = await botRequest('getUserProfilePhotos', { user_id: telegramUserId, limit: 1 });
-    const fileId = photos?.photos?.[0]?.[0]?.file_id;
-    if (!fileId) return null;
-    const file = await botRequest('getFile', { file_id: fileId });
-    return file?.file_path ? `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}` : null;
+    return photos?.photos?.[0]?.[0]?.file_id || null;
   } catch (e) {
-    console.error('getTelegramAvatarUrl error:', e);
+    console.error('getTelegramAvatarFileId error:', e);
     return null;
   }
 }
+
+// Прокси для аватарок из Telegram: принимает file_id (не протухает, не
+// содержит секретов), сам резолвит свежий file_path через getFile и
+// стримит картинку клиенту — токен бота наружу не уходит.
+app.get('/api/avatar/:fileId', async (req, res) => {
+  try {
+    const file = await botRequest('getFile', { file_id: req.params.fileId });
+    if (!file?.file_path) return res.status(404).end();
+
+    const tgRes = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`);
+    if (!tgRes.ok) return res.status(404).end();
+
+    res.set('Content-Type', tgRes.headers.get('content-type') || 'image/jpeg');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(Buffer.from(await tgRes.arrayBuffer()));
+  } catch (e) {
+    console.error('avatar proxy error:', e);
+    res.status(500).end();
+  }
+});
 
 // Отправляет пуш "оставьте отзыв" с кнопкой, открывающей экран отзыва прямо
 // в мини-приложении (web_app-кнопка — Bot API 6.1+, работает в любом чате
