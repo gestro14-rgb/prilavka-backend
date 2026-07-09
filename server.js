@@ -352,7 +352,7 @@ app.get('/api/districts', async (req, res) => {
 // Весь каталог (категории + товары + отзывы + доставки) — то, что раньше было в products.js
 app.get('/api/catalog', async (req, res) => {
   try {
-    const [categoriesRes, subcatsRes, productsRes, reviewsRes, deliveriesRes, compositionsRes] = await Promise.all([
+    const [categoriesRes, subcatsRes, productsRes, reviewsRes, deliveriesRes, compositionsRes, productRatingsRes] = await Promise.all([
       query('SELECT * FROM categories ORDER BY sort_order ASC'),
       query('SELECT * FROM subcategories ORDER BY category_id, sort_order ASC'),
       query(`SELECT p.* FROM products p
@@ -364,12 +364,25 @@ app.get('/api/catalog', async (req, res) => {
       query("SELECT * FROM reviews WHERE status = 'published' ORDER BY id DESC"),
       query('SELECT * FROM deliveries ORDER BY sort_order ASC'),
       query('SELECT * FROM набор_состав ORDER BY product_id, sort_order'),
+      // Агрегат рейтинга по товару — считаем один раз здесь, а не N+1 запросом
+      // на каждую карточку каталога (см. GET /api/products/:id/reviews для
+      // детального списка отзывов на странице товара).
+      query(
+        `SELECT product_id, COUNT(*)::int AS count, AVG(stars)::float AS avg_stars
+         FROM reviews WHERE status = 'published' AND product_id IS NOT NULL
+         GROUP BY product_id`
+      ),
     ]);
 
     const compositionsByProduct = {};
     for (const row of compositionsRes.rows) {
       if (!compositionsByProduct[row.product_id]) compositionsByProduct[row.product_id] = [];
       compositionsByProduct[row.product_id].push(toBundleItemDTO(row));
+    }
+
+    const ratingByProduct = {};
+    for (const row of productRatingsRes.rows) {
+      ratingByProduct[row.product_id] = { avgStars: Math.round(row.avg_stars * 10) / 10, count: row.count };
     }
 
     res.json({
@@ -384,6 +397,7 @@ app.get('/api/catalog', async (req, res) => {
       products: productsRes.rows.map((row) => ({
         ...toProductDTO(row),
         bundleComposition: compositionsByProduct[row.id] ?? null,
+        rating: ratingByProduct[row.id] ?? null,
       })),
       reviews: reviewsRes.rows.map(toReviewDTO),
       deliveries: deliveriesRes.rows.map((d) => ({
