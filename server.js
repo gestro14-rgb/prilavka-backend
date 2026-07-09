@@ -418,6 +418,36 @@ app.get('/api/reviews', async (req, res) => {
   }
 });
 
+// Отзывы на конкретный товар — для секции "Отзывы на этот товар" в карточке
+// товара (ProductDetail). Тот же toReviewDTO, что и у общего списка /api/reviews.
+app.get('/api/products/:id/reviews', async (req, res) => {
+  const productId = req.params.id;
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+  const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+  try {
+    const [listRes, statsRes] = await Promise.all([
+      query(
+        "SELECT * FROM reviews WHERE product_id = $1 AND status = 'published' ORDER BY id DESC LIMIT $2 OFFSET $3",
+        [productId, limit + 1, offset]
+      ),
+      query(
+        "SELECT COUNT(*)::int AS count, COALESCE(AVG(stars), 0)::float AS avg_stars FROM reviews WHERE product_id = $1 AND status = 'published'",
+        [productId]
+      ),
+    ]);
+    const hasMore = listRes.rows.length > limit;
+    res.json({
+      reviews: listRes.rows.slice(0, limit).map(toReviewDTO),
+      hasMore,
+      count: statsRes.rows[0].count,
+      avgStars: Math.round(statsRes.rows[0].avg_stars * 10) / 10,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
 // ============================================================
 // Проверка зоны доставки
 // ============================================================
@@ -839,74 +869,121 @@ app.post('/api/reviews/upload-photo', upload.single('file'), (req, res) => {
   stream.end(req.file.buffer);
 });
 
-// Отправка отзыва по конкретному заказу (экран 7b). Один отзыв на заказ —
-// повторная попытка получит 409 (см. уникальный индекс idx_reviews_order_id).
+// Отправка отзыва по заказу (экран 7b). Тело поддерживает два формата:
+//  - legacy: { telegramUserId, firstName, area, stars, tags, text, photoUrl } —
+//    один отзыв на заказ целиком, product_id = NULL (негативные 1-3★, где
+//    претензия к заказу/доставке, а не к конкретному товару).
+//  - per-product: то же самое + items: [{ productId, stars }, ...] — товаров
+//    в заказе несколько, каждому своя оценка звёздами, текст/фото/теги общие.
+//    Вставляется по строке в reviews на каждый productId в одной транзакции;
+//    баллы за фото начисляются один раз за запрос, а не за товар.
+// Один отзыв на пару (order_id, product_id) — повторная попытка получит 409
+// (см. уникальный индекс idx_reviews_order_product, миграция 021).
 // Все отзывы создаются со status='pending' (публикуются только после
 // модерации в админке — see /api/catalog: WHERE status = 'published').
 app.post('/api/orders/:id/review', async (req, res) => {
   const orderId = parseInt(req.params.id, 10);
-  const { telegramUserId, firstName, area, stars, tags, text, photoUrl } = req.body || {};
+  const { telegramUserId, firstName, area, stars, tags, text, photoUrl, items } = req.body || {};
   const starsNum = Math.min(5, Math.max(1, Number(stars) || 0));
   if (!telegramUserId || isNaN(orderId) || !starsNum) {
     return res.status(400).json({ error: 'Укажите telegramUserId, orderId и stars' });
   }
+
+  let reviewRows;
+  if (Array.isArray(items) && items.length > 0) {
+    reviewRows = items
+      .map((it) => ({
+        productId: it?.productId != null ? String(it.productId) : null,
+        stars: Math.min(5, Math.max(1, Number(it?.stars) || starsNum)),
+      }))
+      .filter((r) => r.productId);
+    if (reviewRows.length === 0) {
+      return res.status(400).json({ error: 'items должен содержать productId' });
+    }
+  } else {
+    reviewRows = [{ productId: null, stars: starsNum }];
+  }
+
+  const avatarFileId = await getTelegramAvatarFileId(telegramUserId);
+  const client = await pool.connect();
   try {
-    const orderRes = await query(
-      "SELECT id, telegram_user_id, status FROM orders WHERE id = $1",
+    await client.query('BEGIN');
+
+    const orderRes = await client.query(
+      "SELECT id, telegram_user_id, status, items FROM orders WHERE id = $1 FOR UPDATE",
       [orderId]
     );
     const order = orderRes.rows[0];
-    if (!order) return res.status(404).json({ error: 'Заказ не найден' });
+    if (!order) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Заказ не найден' }); }
     if (String(order.telegram_user_id) !== String(telegramUserId)) {
+      await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Нет доступа к этому заказу' });
     }
     if (order.status !== 'delivered') {
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Отзыв можно оставить только для доставленного заказа' });
     }
 
-    const emoji = REVIEW_EMOJIS[Math.floor(Math.random() * REVIEW_EMOJIS.length)];
-    const avatarFileId = await getTelegramAvatarFileId(telegramUserId);
-    let review;
+    // productId в теле запроса должен реально входить в состав заказа —
+    // не даём оставить отзыв на чужой товар от имени этого заказа.
+    const orderProductIds = new Set((order.items || []).map((i) => String(i.id)));
+    for (const r of reviewRows) {
+      if (!orderProductIds.has(r.productId)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: `Товар ${r.productId} не найден в этом заказе` });
+      }
+    }
+
+    const insertedIds = [];
     try {
-      const insertRes = await query(
-        `INSERT INTO reviews (name, area, stars, text, emoji, status, telegram_user_id, order_id, tags, image_url, avatar_url)
-         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $9, $10)
-         RETURNING *`,
-        [
-          (firstName || 'Клиент').trim(),
-          (area || '').trim() || 'Москва',
-          starsNum,
-          (text || '').trim() || null,
-          emoji,
-          telegramUserId,
-          orderId,
-          JSON.stringify(Array.isArray(tags) ? tags : []),
-          photoUrl || null,
-          avatarFileId,
-        ]
-      );
-      review = insertRes.rows[0];
+      for (const r of reviewRows) {
+        const emoji = REVIEW_EMOJIS[Math.floor(Math.random() * REVIEW_EMOJIS.length)];
+        const insertRes = await client.query(
+          `INSERT INTO reviews (name, area, stars, text, emoji, status, telegram_user_id, order_id, product_id, tags, image_url, avatar_url)
+           VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $9, $10, $11)
+           RETURNING id`,
+          [
+            (firstName || 'Клиент').trim(),
+            (area || '').trim() || 'Москва',
+            r.stars,
+            (text || '').trim() || null,
+            emoji,
+            telegramUserId,
+            orderId,
+            r.productId,
+            JSON.stringify(Array.isArray(tags) ? tags : []),
+            photoUrl || null,
+            avatarFileId,
+          ]
+        );
+        insertedIds.push(insertRes.rows[0].id);
+      }
     } catch (e) {
-      if (e.code === '23505') return res.status(409).json({ error: 'Вы уже оставляли отзыв по этому заказу' });
+      await client.query('ROLLBACK');
+      if (e.code === '23505') return res.status(409).json({ error: 'Вы уже оставляли отзыв по этому товару из этого заказа' });
       throw e;
     }
 
-    // +N баллов — только за отзыв с фото (см. миграцию 017).
+    // +N баллов — только за отзыв с фото, один раз за запрос (см. миграцию 017).
     let pointsAwarded = 0;
     if (photoUrl) {
       pointsAwarded = Number(getSetting('review_photo_points')) || 0;
       if (pointsAwarded > 0) {
-        await query(
+        await client.query(
           'UPDATE users SET points = points + $1, updated_at = now() WHERE telegram_id = $2',
           [pointsAwarded, telegramUserId]
         );
       }
     }
 
-    res.status(201).json({ id: review.id, pointsAwarded });
+    await client.query('COMMIT');
+    res.status(201).json({ ids: insertedIds, pointsAwarded });
   } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
+  } finally {
+    client.release();
   }
 });
 
@@ -1928,7 +2005,12 @@ app.delete('/api/admin/promo-codes/:id', requireAuth, async (req, res) => {
 
 app.get('/api/admin/reviews', requireAuth, async (req, res) => {
   try {
-    const result = await query('SELECT * FROM reviews ORDER BY id DESC');
+    const result = await query(
+      `SELECT r.*, p.title AS product_title
+       FROM reviews r
+       LEFT JOIN products p ON p.id = r.product_id
+       ORDER BY r.id DESC`
+    );
     res.json(result.rows.map((r) => ({
       id: r.id,
       name: r.name,
@@ -1940,6 +2022,8 @@ app.get('/api/admin/reviews', requireAuth, async (req, res) => {
       imageUrl: r.image_url || null,
       status: r.status || 'published',
       telegramUserId: r.telegram_user_id || null,
+      productId: r.product_id || null,
+      productTitle: r.product_title || null,
     })));
   } catch (e) {
     console.error(e);
