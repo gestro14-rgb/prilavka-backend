@@ -764,6 +764,37 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
+// ============================================================
+// Аналитика поведения (публично — пишет фронт мини-приложения)
+// ============================================================
+
+// Принимает одно событие аналитики. Без авторизации (обычные пользователи),
+// но с базовой валидацией — sessionId и eventType обязательны, остальное
+// опционально. Фронт шлёт это fire-and-forget и игнорирует любой ответ,
+// поэтому ошибки здесь не должны ничего ронять — только логируются.
+app.post('/api/analytics/event', async (req, res) => {
+  const { sessionId, eventType, screenName, metadata, userId } = req.body || {};
+  if (!sessionId || typeof sessionId !== 'string' || !eventType || typeof eventType !== 'string') {
+    return res.status(400).json({ error: 'Укажите sessionId и eventType' });
+  }
+  try {
+    await query(
+      'INSERT INTO analytics_events (user_id, session_id, event_type, screen_name, metadata) VALUES ($1, $2, $3, $4, $5)',
+      [
+        userId || null,
+        sessionId,
+        eventType,
+        screenName || null,
+        metadata ? JSON.stringify(metadata) : null,
+      ]
+    );
+    res.status(201).json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
 // Публичная отмена заказа клиентом — только статус new, не старше 5 минут.
 // Принимает telegramUserId для проверки принадлежности заказа.
 app.post('/api/orders/:id/cancel', async (req, res) => {
@@ -2386,6 +2417,166 @@ app.get('/api/admin/stats', requireAuth, async (req, res) => {
         revenue: r.revenue,
       })),
     });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
+// Админские маршруты — аналитика поведения
+// ============================================================
+
+// from/to — 'YYYY-MM-DD'. По умолчанию — последние 7 дней. `to` включает
+// весь указанный день (до 23:59:59.999).
+function parseAnalyticsRange(reqQuery) {
+  const to = reqQuery.to ? new Date(`${reqQuery.to}T23:59:59.999Z`) : new Date();
+  const from = reqQuery.from
+    ? new Date(`${reqQuery.from}T00:00:00.000Z`)
+    : new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000);
+  return { from: from.toISOString(), to: to.toISOString() };
+}
+
+// Шаги воронки в порядке прохождения. 'home'..'cart' — screen_view по
+// экрану; 'checkout'/'order_placed' — отдельные event_type (в этом
+// приложении оформление — секция экрана "Корзина", а не отдельный роут).
+const FUNNEL_STEPS = [
+  { key: 'home', label: 'Главная' },
+  { key: 'catalog', label: 'Каталог' },
+  { key: 'product', label: 'Товар' },
+  { key: 'cart', label: 'Корзина' },
+  { key: 'checkout', label: 'Оформление' },
+  { key: 'order_placed', label: 'Заказ' },
+];
+
+function funnelStepWhere(stepKey) {
+  switch (stepKey) {
+    case 'checkout': return `event_type = 'checkout_start'`;
+    case 'order_placed': return `event_type = 'order_placed'`;
+    default: return `event_type = 'screen_view' AND screen_name = '${stepKey}'`;
+  }
+}
+
+// Воронка: для каждого шага — уникальные session_id за период (не строго
+// последовательно — сессия считается "дошедшей" до шага, если у неё есть
+// хоть одно подходящее событие в диапазоне), и % отвала от предыдущего шага.
+app.get('/api/admin/analytics/funnel', requireAuth, async (req, res) => {
+  try {
+    const { from, to } = parseAnalyticsRange(req.query);
+    const unionSql = FUNNEL_STEPS
+      .map((s) => `SELECT '${s.key}' AS step, COUNT(DISTINCT session_id)::int AS count
+        FROM analytics_events WHERE ${funnelStepWhere(s.key)} AND created_at >= $1 AND created_at < $2`)
+      .join(' UNION ALL ');
+    const result = await query(unionSql, [from, to]);
+    const countByStep = Object.fromEntries(result.rows.map((r) => [r.step, r.count]));
+
+    let prevCount = null;
+    const steps = FUNNEL_STEPS.map((s) => {
+      const count = countByStep[s.key] || 0;
+      const dropOffPct = prevCount == null
+        ? null
+        : prevCount === 0 ? 0 : Math.round((1 - count / prevCount) * 1000) / 10;
+      prevCount = count;
+      return { step: s.key, label: s.label, count, dropOffPct };
+    });
+
+    res.json({ from, to, steps });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Список сессий за период (опционально — по user_id): дата начала,
+// число событий, до какого шага воронки дошла.
+app.get('/api/admin/analytics/sessions', requireAuth, async (req, res) => {
+  try {
+    const { from, to } = parseAnalyticsRange(req.query);
+    const params = [from, to];
+    let userFilter = '';
+    if (req.query.user_id) {
+      params.push(req.query.user_id);
+      userFilter = `AND user_id = $${params.length}`;
+    }
+    const result = await query(
+      `SELECT
+         session_id,
+         MAX(user_id) AS user_id,
+         MIN(created_at) AS started_at,
+         COUNT(*)::int AS event_count,
+         MAX(
+           CASE
+             WHEN event_type = 'order_placed' THEN 6
+             WHEN event_type = 'checkout_start' THEN 5
+             WHEN event_type = 'screen_view' AND screen_name = 'cart' THEN 4
+             WHEN event_type = 'screen_view' AND screen_name = 'product' THEN 3
+             WHEN event_type = 'screen_view' AND screen_name = 'catalog' THEN 2
+             WHEN event_type = 'screen_view' AND screen_name = 'home' THEN 1
+             ELSE 0
+           END
+         ) AS final_step_rank
+       FROM analytics_events
+       WHERE created_at >= $1 AND created_at < $2 ${userFilter}
+       GROUP BY session_id
+       ORDER BY started_at DESC
+       LIMIT 200`,
+      params
+    );
+    const STEP_BY_RANK = ['other', 'home', 'catalog', 'product', 'cart', 'checkout', 'order_placed'];
+    res.json(result.rows.map((r) => ({
+      sessionId: r.session_id,
+      userId: r.user_id,
+      startedAt: r.started_at,
+      eventCount: r.event_count,
+      finalStep: STEP_BY_RANK[r.final_step_rank] || 'other',
+    })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Полный хронологический путь одной сессии.
+app.get('/api/admin/analytics/sessions/:session_id', requireAuth, async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT user_id, event_type, screen_name, metadata, created_at
+       FROM analytics_events WHERE session_id = $1 ORDER BY created_at ASC`,
+      [req.params.session_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Сессия не найдена' });
+    }
+    res.json({
+      sessionId: req.params.session_id,
+      userId: result.rows.find((r) => r.user_id != null)?.user_id ?? null,
+      events: result.rows.map((r) => ({
+        eventType: r.event_type,
+        screenName: r.screen_name,
+        metadata: r.metadata,
+        createdAt: r.created_at,
+      })),
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Самые посещаемые экраны за период.
+app.get('/api/admin/analytics/top-screens', requireAuth, async (req, res) => {
+  try {
+    const { from, to } = parseAnalyticsRange(req.query);
+    const result = await query(
+      `SELECT screen_name, COUNT(*)::int AS views
+       FROM analytics_events
+       WHERE event_type = 'screen_view' AND screen_name IS NOT NULL
+         AND created_at >= $1 AND created_at < $2
+       GROUP BY screen_name
+       ORDER BY views DESC`,
+      [from, to]
+    );
+    res.json(result.rows.map((r) => ({ screenName: r.screen_name, views: r.views })));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
