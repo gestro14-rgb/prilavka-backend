@@ -93,6 +93,7 @@ function toProductDTO(row) {
     imageUrl: row.image_url || null,
     isBundle: row.is_bundle ?? false,
     subcategoryId: row.subcategory_id ?? null,
+    nutrition: row.nutrition ?? null,
   };
 }
 
