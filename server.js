@@ -91,6 +91,9 @@ function toProductDTO(row) {
     isActive: row.is_active,
     sortOrder: row.sort_order,
     imageUrl: row.image_url || null,
+    // Отдельная картинка для блока "Готовые наборы" на Главной — независима
+    // от imageUrl (карточка/страница товара). Пусто → фронт сам берёт imageUrl.
+    homeImageUrl: row.home_image_url || null,
     isBundle: row.is_bundle ?? false,
     subcategoryId: row.subcategory_id ?? null,
     nutrition: row.nutrition ?? null,
@@ -353,7 +356,7 @@ app.get('/api/districts', async (req, res) => {
 // Весь каталог (категории + товары + отзывы + доставки) — то, что раньше было в products.js
 app.get('/api/catalog', async (req, res) => {
   try {
-    const [categoriesRes, subcatsRes, productsRes, reviewsRes, deliveriesRes, compositionsRes, productRatingsRes] = await Promise.all([
+    const [categoriesRes, subcatsRes, productsRes, reviewsRes, deliveriesRes, compositionsRes, productRatingsRes, homeShelvesRes] = await Promise.all([
       query('SELECT * FROM categories ORDER BY sort_order ASC'),
       query('SELECT * FROM subcategories ORDER BY category_id, sort_order ASC'),
       query(`SELECT p.* FROM products p
@@ -373,6 +376,16 @@ app.get('/api/catalog', async (req, res) => {
          FROM reviews WHERE status = 'published' AND product_id IS NOT NULL
          GROUP BY product_id`
       ),
+      // Ручные подборки витрин Главной (см. migrations/024) — только активные
+      // товары, порядок = sort_order. Пустая витрина здесь = фронт сам
+      // возвращается к автоподбору по badge_type (см. Home.jsx).
+      query(
+        `SELECT hps.shelf, hps.product_id
+         FROM home_product_shelves hps
+         JOIN products p ON p.id = hps.product_id
+         WHERE p.is_active = true
+         ORDER BY hps.shelf, hps.sort_order ASC`
+      ),
     ]);
 
     const compositionsByProduct = {};
@@ -384,6 +397,12 @@ app.get('/api/catalog', async (req, res) => {
     const ratingByProduct = {};
     for (const row of productRatingsRes.rows) {
       ratingByProduct[row.product_id] = { avgStars: Math.round(row.avg_stars * 10) / 10, count: row.count };
+    }
+
+    const homeShelves = {};
+    for (const row of homeShelvesRes.rows) {
+      if (!homeShelves[row.shelf]) homeShelves[row.shelf] = [];
+      homeShelves[row.shelf].push(row.product_id);
     }
 
     res.json({
@@ -405,7 +424,16 @@ app.get('/api/catalog', async (req, res) => {
         emoji: d.emoji,
         title: d.title,
         text: d.text,
+        imageUrl: d.image_url || null,
       })),
+      // Ручные подборки: { hits: [productId, ...], seasonal: [productId, ...] }.
+      // Заголовок/подзаголовок "Сейчас в сезоне" — из settings (редактируется
+      // в админке так же, как остальные настройки).
+      homeShelves,
+      homeContent: {
+        seasonalTitle: getSetting('home_seasonal_title') || 'Сейчас в сезоне',
+        seasonalSubtitle: getSetting('home_seasonal_subtitle') || '',
+      },
     });
   } catch (e) {
     console.error(e);
@@ -1397,8 +1425,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
   try {
     await query(
       `INSERT INTO products
-        (id, title, price, weight, emoji, bg, category, badge_type, badge_label, composition, suppliers, pricing, is_active, sort_order, image_url, is_bundle, subcategory_id, nutrition)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+        (id, title, price, weight, emoji, bg, category, badge_type, badge_label, composition, suppliers, pricing, is_active, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
       [
         p.id,
         p.title,
@@ -1418,6 +1446,7 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
         p.isBundle === true,
         p.subcategoryId || null,
         p.nutrition ? JSON.stringify(p.nutrition) : null,
+        p.homeImageUrl || null,
       ]
     );
     const result = await query('SELECT * FROM products WHERE id = $1', [p.id]);
@@ -1458,8 +1487,9 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         is_bundle = $15,
         subcategory_id = $16,
         nutrition = $17,
+        home_image_url = $18,
         updated_at = now()
-       WHERE id = $18`,
+       WHERE id = $19`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -1480,6 +1510,7 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         p.nutrition !== undefined
           ? (p.nutrition ? JSON.stringify(p.nutrition) : null)
           : (cur.nutrition ? JSON.stringify(cur.nutrition) : null),
+        p.homeImageUrl !== undefined ? (p.homeImageUrl || null) : (cur.home_image_url || null),
         req.params.id,
       ]
     );
@@ -2155,6 +2186,7 @@ app.get('/api/admin/deliveries', requireAuth, async (req, res) => {
       emoji: d.emoji,
       title: d.title,
       text: d.text,
+      imageUrl: d.image_url || null,
       sortOrder: d.sort_order,
     })));
   } catch (e) {
@@ -2164,18 +2196,45 @@ app.get('/api/admin/deliveries', requireAuth, async (req, res) => {
 });
 
 app.post('/api/admin/deliveries', requireAuth, async (req, res) => {
-  const { emoji, title, text, sortOrder } = req.body || {};
+  const { emoji, title, text, imageUrl, sortOrder } = req.body || {};
   if (!emoji || !title || !text) {
     return res.status(400).json({ error: 'Обязательные поля: emoji, title, text' });
   }
   try {
     const result = await query(
-      `INSERT INTO deliveries (emoji, title, text, sort_order)
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [emoji, title, text, Number(sortOrder) || 0]
+      `INSERT INTO deliveries (emoji, title, text, image_url, sort_order)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [emoji, title, text, imageUrl || null, Number(sortOrder) || 0]
     );
     const d = result.rows[0];
-    res.status(201).json({ id: d.id, emoji: d.emoji, title: d.title, text: d.text, sortOrder: d.sort_order });
+    res.status(201).json({ id: d.id, emoji: d.emoji, title: d.title, text: d.text, imageUrl: d.image_url || null, sortOrder: d.sort_order });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Фото/эмодзи/текст/порядок доставки — редактируются после создания (раньше
+// можно было только создать или удалить запись целиком).
+app.put('/api/admin/deliveries/:id', requireAuth, async (req, res) => {
+  const { emoji, title, text, imageUrl, sortOrder } = req.body || {};
+  try {
+    const existing = await query('SELECT * FROM deliveries WHERE id = $1', [req.params.id]);
+    if (!existing.rows[0]) return res.status(404).json({ error: 'Запись не найдена' });
+    const cur = existing.rows[0];
+    const result = await query(
+      `UPDATE deliveries SET emoji = $1, title = $2, text = $3, image_url = $4, sort_order = $5 WHERE id = $6 RETURNING *`,
+      [
+        emoji ?? cur.emoji,
+        title ?? cur.title,
+        text ?? cur.text,
+        imageUrl !== undefined ? (imageUrl || null) : cur.image_url,
+        sortOrder !== undefined ? Number(sortOrder) : cur.sort_order,
+        req.params.id,
+      ]
+    );
+    const d = result.rows[0];
+    res.json({ id: d.id, emoji: d.emoji, title: d.title, text: d.text, imageUrl: d.image_url || null, sortOrder: d.sort_order });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
@@ -2185,6 +2244,86 @@ app.post('/api/admin/deliveries', requireAuth, async (req, res) => {
 app.delete('/api/admin/deliveries/:id', requireAuth, async (req, res) => {
   try {
     const result = await query('DELETE FROM deliveries WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Запись не найдена' });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
+// Админские маршруты — витрины Главной (ручные подборки товаров)
+// ============================================================
+
+// Список товаров в подборке ?shelf=hits|seasonal, с названием товара для
+// удобного отображения в админке (join, не отдельным запросом на каждую строку).
+app.get('/api/admin/home-shelves', requireAuth, async (req, res) => {
+  const { shelf } = req.query;
+  if (!shelf) return res.status(400).json({ error: 'Укажите shelf' });
+  try {
+    const result = await query(
+      `SELECT hps.id, hps.shelf, hps.product_id, hps.sort_order, p.title AS product_title, p.image_url AS product_image_url
+       FROM home_product_shelves hps
+       JOIN products p ON p.id = hps.product_id
+       WHERE hps.shelf = $1
+       ORDER BY hps.sort_order ASC, hps.id ASC`,
+      [shelf]
+    );
+    res.json(result.rows.map((r) => ({
+      id: r.id,
+      shelf: r.shelf,
+      productId: r.product_id,
+      productTitle: r.product_title,
+      productImageUrl: r.product_image_url || null,
+      sortOrder: r.sort_order,
+    })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.post('/api/admin/home-shelves', requireAuth, async (req, res) => {
+  const { shelf, productId, sortOrder } = req.body || {};
+  if (!shelf || !productId) {
+    return res.status(400).json({ error: 'Укажите shelf и productId' });
+  }
+  try {
+    const result = await query(
+      `INSERT INTO home_product_shelves (shelf, product_id, sort_order) VALUES ($1, $2, $3) RETURNING *`,
+      [shelf, productId, Number(sortOrder) || 0]
+    );
+    const r = result.rows[0];
+    res.status(201).json({ id: r.id, shelf: r.shelf, productId: r.product_id, sortOrder: r.sort_order });
+  } catch (e) {
+    console.error(e);
+    if (e.code === '23505') {
+      return res.status(409).json({ error: 'Этот товар уже в подборке' });
+    }
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.put('/api/admin/home-shelves/:id', requireAuth, async (req, res) => {
+  const { sortOrder } = req.body || {};
+  try {
+    const result = await query(
+      'UPDATE home_product_shelves SET sort_order = $1 WHERE id = $2 RETURNING *',
+      [Number(sortOrder) || 0, req.params.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Запись не найдена' });
+    const r = result.rows[0];
+    res.json({ id: r.id, shelf: r.shelf, productId: r.product_id, sortOrder: r.sort_order });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.delete('/api/admin/home-shelves/:id', requireAuth, async (req, res) => {
+  try {
+    const result = await query('DELETE FROM home_product_shelves WHERE id = $1', [req.params.id]);
     if (result.rowCount === 0) return res.status(404).json({ error: 'Запись не найдена' });
     res.json({ ok: true });
   } catch (e) {
