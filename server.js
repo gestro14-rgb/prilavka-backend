@@ -119,9 +119,37 @@ function toReviewDTO(row) {
     text: row.text,
     emoji: row.emoji,
     imageUrl: row.image_url || null,
+    orderId: row.order_id || null,
     // avatar_url хранит только Telegram file_id (не протухает, не содержит
     // токена) — резолвится в реальную картинку через прокси-эндпоинт ниже.
     avatarUrl: row.avatar_url ? `${BACKEND_PUBLIC_URL}/api/avatar/${row.avatar_url}` : null,
+  };
+}
+
+// Агрегат для сводки рейтинга/гистограммы/чипов-фильтров — переиспользуется
+// в /api/catalog (компактная сводка на Главной) и /api/reviews (полная сводка
+// на /reviews). Всегда без учёта rating/photo-фильтра запроса, иначе цифры
+// на чипах менялись бы при клике по чипу.
+const REVIEW_STATS_QUERY = `
+  SELECT
+    COUNT(*)::int AS total,
+    COUNT(*) FILTER (WHERE image_url IS NOT NULL)::int AS with_photo,
+    COUNT(*) FILTER (WHERE stars = 5)::int AS stars_5,
+    COUNT(*) FILTER (WHERE stars = 4)::int AS stars_4,
+    COUNT(*) FILTER (WHERE stars = 3)::int AS stars_3,
+    COUNT(*) FILTER (WHERE stars = 2)::int AS stars_2,
+    COUNT(*) FILTER (WHERE stars = 1)::int AS stars_1,
+    COALESCE(AVG(stars), 0)::float AS avg_stars
+  FROM reviews
+  WHERE status = 'published'
+`;
+
+function toReviewStatsDTO(row) {
+  return {
+    total: row.total,
+    withPhoto: row.with_photo,
+    avgStars: Math.round(row.avg_stars * 10) / 10,
+    histogram: { 5: row.stars_5, 4: row.stars_4, 3: row.stars_3, 2: row.stars_2, 1: row.stars_1 },
   };
 }
 
@@ -356,7 +384,7 @@ app.get('/api/districts', async (req, res) => {
 // Весь каталог (категории + товары + отзывы + доставки) — то, что раньше было в products.js
 app.get('/api/catalog', async (req, res) => {
   try {
-    const [categoriesRes, subcatsRes, productsRes, reviewsRes, deliveriesRes, compositionsRes, productRatingsRes, homeShelvesRes] = await Promise.all([
+    const [categoriesRes, subcatsRes, productsRes, reviewsRes, reviewStatsRes, deliveriesRes, compositionsRes, productRatingsRes, homeShelvesRes] = await Promise.all([
       query('SELECT * FROM categories ORDER BY sort_order ASC'),
       query('SELECT * FROM subcategories ORDER BY category_id, sort_order ASC'),
       query(`SELECT p.* FROM products p
@@ -366,6 +394,9 @@ app.get('/api/catalog', async (req, res) => {
       // Новые сверху. У reviews нет created_at — id (SERIAL) монотонно растёт
       // с вставкой, так что id DESC надёжно даёт порядок "новые первые".
       query("SELECT * FROM reviews WHERE status = 'published' ORDER BY id DESC"),
+      // Сводка рейтинга/гистограммы для блока отзывов на Главной (см.
+      // toReviewStatsDTO) — тот же агрегат, что и в GET /api/reviews.
+      query(REVIEW_STATS_QUERY),
       query('SELECT * FROM deliveries ORDER BY sort_order ASC'),
       query('SELECT * FROM набор_состав ORDER BY product_id, sort_order'),
       // Агрегат рейтинга по товару — считаем один раз здесь, а не N+1 запросом
@@ -420,6 +451,7 @@ app.get('/api/catalog', async (req, res) => {
         rating: ratingByProduct[row.id] ?? null,
       })),
       reviews: reviewsRes.rows.map(toReviewDTO),
+      reviewStats: toReviewStatsDTO(reviewStatsRes.rows[0]),
       deliveries: deliveriesRes.rows.map((d) => ({
         emoji: d.emoji,
         title: d.title,
@@ -447,14 +479,42 @@ app.get('/api/catalog', async (req, res) => {
 app.get('/api/reviews', async (req, res) => {
   const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
   const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+
+  // Опциональные фильтры чипов ("5★", "С фото") — серверные, не клиентские:
+  // у списка уже есть пагинация, клиентский фильтр по уже загруженной
+  // странице показывал бы неполную выборку вместо всех подходящих отзывов.
+  const params = [];
+  let where = "WHERE status = 'published'";
+  const rating = parseInt(req.query.rating, 10);
+  if (rating >= 1 && rating <= 5) {
+    params.push(rating);
+    where += ` AND stars = $${params.length}`;
+  }
+  if (req.query.photo === '1') {
+    where += ' AND image_url IS NOT NULL';
+  }
+  // Берём на 1 больше лимита — если пришло больше, значит есть следующая страница.
+  params.push(limit + 1);
+  const limitIdx = params.length;
+  params.push(offset);
+  const offsetIdx = params.length;
+
   try {
-    // Берём на 1 больше лимита — если пришло больше, значит есть следующая страница.
-    const result = await query(
-      "SELECT * FROM reviews WHERE status = 'published' ORDER BY id DESC LIMIT $1 OFFSET $2",
-      [limit + 1, offset]
-    );
-    const hasMore = result.rows.length > limit;
-    res.json({ reviews: result.rows.slice(0, limit).map(toReviewDTO), hasMore });
+    const [listRes, statsRes] = await Promise.all([
+      query(
+        `SELECT * FROM reviews ${where} ORDER BY id DESC LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+        params
+      ),
+      // Сводка/гистограмма — всегда по всем отзывам, без учёта rating/photo
+      // выше, иначе цифры на чипах "прыгали" бы при клике по чипу.
+      query(REVIEW_STATS_QUERY),
+    ]);
+    const hasMore = listRes.rows.length > limit;
+    res.json({
+      reviews: listRes.rows.slice(0, limit).map(toReviewDTO),
+      hasMore,
+      stats: toReviewStatsDTO(statsRes.rows[0]),
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
