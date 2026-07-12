@@ -89,6 +89,9 @@ function toProductDTO(row) {
     suppliers: row.suppliers,
     pricing: row.pricing,
     isActive: row.is_active,
+    // "Разобрали" (DESIGN.md §4.1) — отдельно от isActive: товар остаётся
+    // в каталоге, просто в особом визуальном состоянии (см. ProductCard.jsx).
+    inStock: row.in_stock,
     sortOrder: row.sort_order,
     imageUrl: row.image_url || null,
     // Отдельная картинка для блока "Готовые наборы" на Главной — независима
@@ -1485,8 +1488,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
   try {
     await query(
       `INSERT INTO products
-        (id, title, price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+        (id, title, price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
       [
         p.id,
         p.title,
@@ -1502,6 +1505,7 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
         JSON.stringify(p.suppliers || []),
         JSON.stringify(p.pricing || []),
         p.isActive !== false,
+        p.inStock !== false,
         p.sortOrder || 0,
         p.imageUrl || null,
         p.isBundle === true,
@@ -1544,14 +1548,15 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         suppliers = $11,
         pricing = $12,
         is_active = $13,
-        sort_order = $14,
-        image_url = $15,
-        is_bundle = $16,
-        subcategory_id = $17,
-        nutrition = $18,
-        home_image_url = $19,
+        in_stock = $14,
+        sort_order = $15,
+        image_url = $16,
+        is_bundle = $17,
+        subcategory_id = $18,
+        nutrition = $19,
+        home_image_url = $20,
         updated_at = now()
-       WHERE id = $20`,
+       WHERE id = $21`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -1566,6 +1571,7 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         p.suppliers !== undefined ? JSON.stringify(p.suppliers) : JSON.stringify(cur.suppliers),
         p.pricing !== undefined ? JSON.stringify(p.pricing) : JSON.stringify(cur.pricing),
         p.isActive ?? cur.is_active,
+        p.inStock ?? cur.in_stock,
         p.sortOrder ?? cur.sort_order,
         p.imageUrl !== undefined ? (p.imageUrl || null) : (cur.image_url || null),
         p.isBundle !== undefined ? p.isBundle === true : cur.is_bundle,
