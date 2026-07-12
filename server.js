@@ -1731,6 +1731,46 @@ app.delete('/api/admin/categories/:id', requireAuth, async (req, res) => {
   }
 });
 
+// Полная перезапись порядка категорий — принимает order: [id, id, ...] в
+// желаемой последовательности (все существующие id ровно по одному разу),
+// перенумеровывает sort_order шагом 10 (см. миграцию 025 — тот же шаг, чтобы
+// потом можно было вставить категорию между существующими). Переписываем
+// весь список одним запросом от клиента, а не пара-от-пары своп двух строк —
+// так исчезают "зависшие" одинаковые sort_order у категорий, которых это
+// переупорядочивание не касалось.
+app.put('/api/admin/categories/reorder', requireAuth, async (req, res) => {
+  const { order } = req.body || {};
+  if (!Array.isArray(order) || order.length === 0) {
+    return res.status(400).json({ error: 'Укажите order — массив id категорий в нужном порядке' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const existing = await client.query('SELECT id FROM categories');
+    const existingIds = new Set(existing.rows.map((r) => r.id));
+    const isValidPermutation =
+      order.length === existingIds.size &&
+      new Set(order).size === order.length &&
+      order.every((id) => existingIds.has(id));
+    if (!isValidPermutation) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'order должен содержать все существующие категории ровно по одному разу' });
+    }
+    for (let i = 0; i < order.length; i++) {
+      await client.query('UPDATE categories SET sort_order = $1 WHERE id = $2', [(i + 1) * 10, order[i]]);
+    }
+    await client.query('COMMIT');
+    const result = await query('SELECT * FROM categories ORDER BY sort_order ASC');
+    res.json(result.rows);
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  } finally {
+    client.release();
+  }
+});
+
 // ============================================================
 // Админские маршруты — подкатегории
 // ============================================================
