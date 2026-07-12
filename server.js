@@ -172,6 +172,87 @@ function requireAuth(req, res, next) {
   }
 }
 
+// Проверка подписи Telegram initData — алгоритм из официальной документации
+// (https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app):
+// secret_key = HMAC_SHA256(<bot_token>, "WebAppData"),
+// hash = HEX(HMAC_SHA256(data_check_string, secret_key)),
+// data_check_string — все поля кроме hash, отсортированные по ключу, "key=value" через \n.
+// Раньше сервер верил telegramId, который просто прислал клиент в теле/URL
+// запроса — эта функция закрывает именно эту дыру.
+const INIT_DATA_MAX_AGE_SEC = 24 * 60 * 60; // сутки — как рекомендует Telegram
+
+function verifyTelegramInitData(initData, botToken) {
+  if (!initData || !botToken) return null;
+  const params = new URLSearchParams(initData);
+  const hash = params.get('hash');
+  if (!hash) return null;
+  params.delete('hash');
+
+  const dataCheckString = [...params.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
+
+  const secretKey = crypto.createHmac('sha256', 'WebAppData').update(botToken).digest();
+  const computedHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+
+  const a = Buffer.from(computedHash, 'hex');
+  const b = Buffer.from(hash, 'hex');
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+
+  const authDate = Number(params.get('auth_date'));
+  if (!authDate || Date.now() / 1000 - authDate > INIT_DATA_MAX_AGE_SEC) return null;
+
+  const userRaw = params.get('user');
+  if (!userRaw) return null;
+  try {
+    return { user: JSON.parse(userRaw), authDate };
+  } catch {
+    return null;
+  }
+}
+
+// Единая проверка личности для пользовательских (не админских) эндпоинтов —
+// один и тот же заголовок Authorization: Bearer <токен>, но токен бывает
+// двух видов: JWT нашей выдачи (телефонный вход, /api/auth/verify-code) или
+// сырой Telegram initData (Mini App). JWT всегда 3 base64url-сегмента через
+// точку — по этому и различаем, не по отдельному полю/пути.
+const JWT_SHAPE = /^[\w-]+\.[\w-]+\.[\w-]+$/;
+
+async function resolveUser(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) {
+    return res.status(401).json({ error: 'Требуется авторизация' });
+  }
+
+  try {
+    let row;
+    if (JWT_SHAPE.test(token)) {
+      const payload = jwt.verify(token, JWT_SECRET);
+      const userRes = await query('SELECT * FROM users WHERE id = $1', [payload.sub]);
+      row = userRes.rows[0];
+      if (!row) return res.status(401).json({ error: 'Пользователь не найден' });
+    } else {
+      const verified = verifyTelegramInitData(token, TELEGRAM_BOT_TOKEN);
+      if (!verified) {
+        return res.status(401).json({ error: 'Недействительные данные Telegram' });
+      }
+      const tgUser = verified.user;
+      row = await upsertUser(tgUser.id, tgUser.username, tgUser.first_name);
+    }
+    // req.user — полная строка (username/first_name/telegram_id/phone), не
+    // только id, чтобы эндпоинтам вроде POST /api/orders не нужно было
+    // делать отдельный SELECT ради имени для Telegram-уведомления и т.п.
+    req.user = row;
+    req.userId = row.id;
+    req.telegramId = row.telegram_id;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: 'Недействительный или просроченный токен' });
+  }
+}
+
 // Геокодирование адреса через Яндекс Geocoder HTTP API.
 // Возвращает { lat, lng, formatted } или null, если адрес не найден.
 async function geocodeAddress(address) {
@@ -652,8 +733,13 @@ app.post('/api/promo/check', async (req, res) => {
   }
 });
 
-// Создать заказ (из мини-приложения). Сохраняет в базу и присылает уведомление в Telegram.
-app.post('/api/orders', async (req, res) => {
+// Создать заказ (из мини-приложения или браузера). Сохраняет в базу и
+// присылает уведомление в Telegram. Личность — из resolveUser (JWT
+// телефонного входа ИЛИ проверенный Telegram initData), не из тела запроса:
+// раньше клиент присылал telegramUser напрямую и сервер верил на слово —
+// значит мог начислить/списать баллы, применить промокод или отметить чужую
+// pending-награду использованной от имени произвольного telegramId.
+app.post('/api/orders', resolveUser, async (req, res) => {
   const {
     items,
     total,
@@ -664,12 +750,14 @@ app.post('/api/orders', async (req, res) => {
     phone,
     comment,
     paymentMethod,
-    telegramUser,
     promoCode,
     referralCode,
     pointsToSpend,
     leaveAtDoor,
   } = req.body || {};
+  const telegramUser = req.telegramId
+    ? { id: req.telegramId, username: req.user.username, firstName: req.user.first_name }
+    : null;
 
   if (!Array.isArray(items) || items.length === 0 || total == null) {
     return res.status(400).json({ error: 'Укажите items и total' });
@@ -733,14 +821,15 @@ app.post('/api/orders', async (req, res) => {
       }
     }
 
-    // Применяем баллы (только если нет промокода и есть авторизованный пользователь)
+    // Применяем баллы — req.userId есть всегда (resolveUser обязателен для
+    // этого эндпоинта), поэтому это уже работает и для телефонного входа,
+    // не только для Telegram, как было раньше (гейт был telegramUser?.id).
     let pointsSpent = 0;
-    if (!appliedPromo && !appliedReferral && pointsToSpend > 0 && telegramUser?.id) {
+    if (!appliedPromo && !appliedReferral && pointsToSpend > 0) {
       const maxByPercent = Math.floor(total * (Number(getSetting('max_points_spend_percent')) / 100));
       const allowed = Math.min(pointsToSpend, maxByPercent);
       if (allowed > 0) {
-        const balanceRes = await query('SELECT points FROM users WHERE telegram_id = $1', [telegramUser.id]);
-        const balance = balanceRes.rows[0]?.points ?? 0;
+        const balance = req.user.points ?? 0;
         pointsSpent = Math.min(allowed, balance);
         if (pointsSpent > 0) {
           discountAmount += pointsSpent;
@@ -756,9 +845,9 @@ app.post('/api/orders', async (req, res) => {
         `SELECT ur.id AS user_reward_id, r.title, r.emoji
          FROM user_rewards ur
          JOIN rewards r ON ur.reward_id = r.id
-         WHERE ur.telegram_id = $1 AND ur.status = 'pending'
+         WHERE ur.user_id = $1 AND ur.status = 'pending'
          LIMIT 1`,
-        [telegramUser?.id || 0]
+        [req.userId]
       );
       pendingReward = prRes.rows[0] || null;
     } catch (e) {
@@ -770,8 +859,8 @@ app.post('/api/orders', async (req, res) => {
 
     const result = await query(
       `INSERT INTO orders
-        (items, total, delivery_date, delivery_slot, address_street, address_details, phone, comment, payment_method, promo_code, discount_amount, telegram_user_id, telegram_username, telegram_first_name, referral_code, leave_at_door)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+        (items, total, delivery_date, delivery_slot, address_street, address_details, phone, comment, payment_method, promo_code, discount_amount, telegram_user_id, telegram_username, telegram_first_name, referral_code, leave_at_door, user_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
        RETURNING *`,
       [
         JSON.stringify(orderItems),
@@ -790,6 +879,7 @@ app.post('/api/orders', async (req, res) => {
         telegramUser?.firstName || null,
         appliedReferral ? appliedReferralCode : null,
         leaveAtDoor === true,
+        req.userId,
       ]
     );
 
@@ -804,15 +894,15 @@ app.post('/api/orders', async (req, res) => {
     }
 
     // Списываем баллы после успешного создания заказа
-    if (pointsSpent > 0 && telegramUser?.id) {
+    if (pointsSpent > 0) {
       await query(
-        'UPDATE users SET points = GREATEST(0, points - $1), updated_at = now() WHERE telegram_id = $2',
-        [pointsSpent, telegramUser.id]
+        'UPDATE users SET points = GREATEST(0, points - $1), updated_at = now() WHERE id = $2',
+        [pointsSpent, req.userId]
       );
     }
 
     // Помечаем pending-награду как использованную
-    if (pendingReward && telegramUser?.id) {
+    if (pendingReward) {
       try {
         await query("UPDATE user_rewards SET status = 'used' WHERE id = $1", [pendingReward.user_reward_id]);
       } catch (e) {
@@ -1176,30 +1266,149 @@ function getLoyaltyLevel(ordersCount) {
   };
 }
 
-// Статистика пользователя: уровень лояльности, эко-счётчик, реферальный код и баллы.
-// При каждом вызове делает upsert пользователя (создаёт запись и код если нет).
-// Принимает username и firstName как query-параметры для сохранения имени.
-app.get('/api/users/:telegramId/stats', async (req, res) => {
-  const telegramId = req.params.telegramId;
-  const { username, firstName } = req.query;
+// ============================================================
+// Авторизация по телефону (браузер, вне Telegram)
+// ============================================================
 
-  if (!telegramId || telegramId === '0') {
-    return res.json({
-      ordersCount: 0,
-      level: getLoyaltyLevel(0),
-      eco: { packagingSaved: 0, co2SavedKg: 0 },
-      referralCode: null,
-      points: 0,
-      referralsCount: 0,
-      referralPointsReward: Number(getSetting('referral_points_reward')),
-    });
+const SMS_RU_API_ID = process.env.SMS_RU_API_ID || '';
+const VERIFICATION_CODE_TTL_SEC = 5 * 60;
+const VERIFICATION_CODE_RESEND_COOLDOWN_SEC = 60;
+const VERIFICATION_CODE_MAX_ATTEMPTS = 5;
+
+// +7XXXXXXXXXX — единый формат хранения/сравнения. Достаточно строгая
+// нормализация (10 цифр после кода страны) — сложные кейсы (другие страны)
+// сюда пока не входят, аудитория продукта — Россия.
+function normalizePhone(raw) {
+  const digits = String(raw || '').replace(/\D/g, '');
+  if (digits.length === 11 && (digits[0] === '7' || digits[0] === '8')) {
+    return '+7' + digits.slice(1);
   }
+  if (digits.length === 10) return '+7' + digits;
+  return null;
+}
 
+function generateVerificationCode() {
+  return String(Math.floor(1000 + Math.random() * 9000)); // 4 цифры
+}
+
+// SMS.ru HTTP API (sms.ru/api) — простой GET, JSON-ответ. Без SMS_RU_API_ID
+// (ключ ещё не добавлен в Railway) код просто пишется в лог сервера — чтобы
+// можно было доразработать и проверить остальной флоу до подключения
+// реального провайдера, а не блокироваться на нём.
+async function sendSms(phone, text) {
+  if (!SMS_RU_API_ID) {
+    console.log(`[SMS.ru не настроен — DEV] ${phone}: ${text}`);
+    return;
+  }
+  const url = new URL('https://sms.ru/sms/send');
+  url.searchParams.set('api_id', SMS_RU_API_ID);
+  url.searchParams.set('to', phone);
+  url.searchParams.set('msg', text);
+  url.searchParams.set('json', '1');
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data.status !== 'OK') {
+    throw new Error(`SMS.ru: ${data.status_text || data.status_code || 'неизвестная ошибка'}`);
+  }
+}
+
+// Аналог upsertUser, но по телефону — для входа без Telegram. ON CONFLICT
+// нацелен на users_phone_key (миграция 028) — партиционный уникальный
+// индекс, поэтому WHERE phone IS NOT NULL обязателен в самом ON CONFLICT.
+async function upsertUserByPhone(phone) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = generateReferralCode();
+    try {
+      const result = await query(
+        `INSERT INTO users (phone, referral_code)
+         VALUES ($1, $2)
+         ON CONFLICT (phone) WHERE phone IS NOT NULL DO UPDATE SET
+           updated_at = now()
+         RETURNING *`,
+        [phone, code]
+      );
+      return result.rows[0];
+    } catch (e) {
+      if (e.code === '23505' && e.detail?.includes('referral_code')) continue;
+      throw e;
+    }
+  }
+  throw new Error('Не удалось сгенерировать уникальный реферальный код');
+}
+
+app.post('/api/auth/request-code', async (req, res) => {
+  const phone = normalizePhone(req.body?.phone);
+  if (!phone) {
+    return res.status(400).json({ error: 'Укажите корректный номер телефона' });
+  }
   try {
-    const [userRecord, ordersRes] = await Promise.all([
-      upsertUser(telegramId, username, firstName),
-      query('SELECT COUNT(*)::int AS count FROM orders WHERE telegram_user_id = $1', [telegramId]),
-    ]);
+    const recent = await query(
+      `SELECT created_at FROM phone_verification_codes
+       WHERE phone = $1 ORDER BY created_at DESC LIMIT 1`,
+      [phone]
+    );
+    const last = recent.rows[0];
+    if (last && (Date.now() - new Date(last.created_at).getTime()) / 1000 < VERIFICATION_CODE_RESEND_COOLDOWN_SEC) {
+      return res.status(429).json({ error: 'Код уже отправлен — попробуйте через минуту' });
+    }
+
+    const code = generateVerificationCode();
+    await query(
+      `INSERT INTO phone_verification_codes (phone, code, expires_at)
+       VALUES ($1, $2, now() + interval '${VERIFICATION_CODE_TTL_SEC} seconds')`,
+      [phone, code]
+    );
+    await sendSms(phone, `Код для входа в Прилавку: ${code}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Не удалось отправить код — попробуйте ещё раз' });
+  }
+});
+
+app.post('/api/auth/verify-code', async (req, res) => {
+  const phone = normalizePhone(req.body?.phone);
+  const code = String(req.body?.code || '').trim();
+  if (!phone || !code) {
+    return res.status(400).json({ error: 'Укажите телефон и код' });
+  }
+  try {
+    const result = await query(
+      `SELECT * FROM phone_verification_codes
+       WHERE phone = $1 AND expires_at > now()
+       ORDER BY created_at DESC LIMIT 1`,
+      [phone]
+    );
+    const row = result.rows[0];
+    if (!row) {
+      return res.status(400).json({ error: 'Код не найден или истёк — запросите новый' });
+    }
+    if (row.attempts >= VERIFICATION_CODE_MAX_ATTEMPTS) {
+      return res.status(429).json({ error: 'Слишком много попыток — запросите новый код' });
+    }
+    if (row.code !== code) {
+      await query('UPDATE phone_verification_codes SET attempts = attempts + 1 WHERE id = $1', [row.id]);
+      return res.status(400).json({ error: 'Неверный код' });
+    }
+
+    await query('DELETE FROM phone_verification_codes WHERE phone = $1', [phone]);
+    const user = await upsertUserByPhone(phone);
+    const token = jwt.sign({ sub: user.id, phone: user.phone }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Статистика пользователя: уровень лояльности, эко-счётчик, реферальный код и баллы.
+// Личность уже установлена resolveUser (телефонный JWT ИЛИ проверенный
+// Telegram initData) — сам эндпоинт больше никого не апсертит и не
+// принимает telegramId откуда-либо от клиента.
+app.get('/api/me/stats', resolveUser, async (req, res) => {
+  try {
+    const userRecord = req.user; // resolveUser уже загрузил строку целиком
+    const ordersRes = await query('SELECT COUNT(*)::int AS count FROM orders WHERE user_id = $1', [req.userId]);
 
     const ordersCount = ordersRes.rows[0]?.count || 0;
     const level = getLoyaltyLevel(ordersCount);
@@ -1208,9 +1417,13 @@ app.get('/api/users/:telegramId/stats', async (req, res) => {
       co2SavedKg: Math.round(ordersCount * 0.5 * 10) / 10,
     };
 
+    // Реферальная программа остаётся Telegram-only (referred_by_id
+    // по-прежнему ссылается на telegram_id, см. план) — у телефонного
+    // пользователя userRecord.telegram_id будет NULL, и WHERE ... = NULL
+    // в SQL корректно даёт 0 (не требует отдельной ветки).
     const referralsRes = await query(
       'SELECT COUNT(*)::int AS count FROM users WHERE referred_by_id = $1',
-      [telegramId]
+      [userRecord.telegram_id]
     );
 
     res.json({
@@ -1228,22 +1441,20 @@ app.get('/api/users/:telegramId/stats', async (req, res) => {
   }
 });
 
-// Последние 10 заказов пользователя по telegram_user_id — для истории в профиле.
+// Последние 10 заказов пользователя — для истории в профиле.
 // hasReview/reviewDismissedAt — чтобы главная и профиль сами решали, показывать
 // ли баннер/пуш "оставьте отзыв" для конкретного заказа (без отдельного запроса).
-app.get('/api/users/:telegramId/orders', async (req, res) => {
-  const { telegramId } = req.params;
-  if (!telegramId || telegramId === '0') return res.json([]);
+app.get('/api/me/orders', resolveUser, async (req, res) => {
   try {
     const result = await query(
       `SELECT o.id, o.total, o.status, o.created_at, o.items, o.delivery_date, o.delivery_slot,
               o.review_dismissed_at, (r.id IS NOT NULL) AS has_review
        FROM orders o
        LEFT JOIN reviews r ON r.order_id = o.id
-       WHERE o.telegram_user_id = $1
+       WHERE o.user_id = $1
        ORDER BY o.created_at DESC
        LIMIT 10`,
-      [telegramId]
+      [req.userId]
     );
     res.json(result.rows.map((o) => ({
       id: o.id,
@@ -1263,30 +1474,20 @@ app.get('/api/users/:telegramId/orders', async (req, res) => {
 });
 
 // Текущий баланс баллов пользователя — лёгкий эндпоинт для корзины.
-app.get('/api/users/:telegramId/balance', async (req, res) => {
-  const { telegramId } = req.params;
-  if (!telegramId || telegramId === '0') return res.json({ points: 0 });
-  try {
-    const result = await query('SELECT points FROM users WHERE telegram_id = $1', [telegramId]);
-    res.json({ points: result.rows[0]?.points ?? 0 });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Ошибка сервера' });
-  }
+app.get('/api/me/balance', resolveUser, async (req, res) => {
+  res.json({ points: req.user.points ?? 0 });
 });
 
 // Pending-награда пользователя (если есть) — для корзины и профиля.
-app.get('/api/users/:telegramId/pending-reward', async (req, res) => {
-  const { telegramId } = req.params;
-  if (!telegramId || telegramId === '0') return res.json(null);
+app.get('/api/me/pending-reward', resolveUser, async (req, res) => {
   try {
     const result = await query(
       `SELECT ur.id AS user_reward_id, ur.reward_id, r.title, r.emoji, r.description
        FROM user_rewards ur
        JOIN rewards r ON ur.reward_id = r.id
-       WHERE ur.telegram_id = $1 AND ur.status = 'pending'
+       WHERE ur.user_id = $1 AND ur.status = 'pending'
        LIMIT 1`,
-      [telegramId]
+      [req.userId]
     );
     res.json(result.rows[0] || null);
   } catch (e) {
@@ -1296,10 +1497,8 @@ app.get('/api/users/:telegramId/pending-reward', async (req, res) => {
 });
 
 // Обменять баллы на награду (транзакция: проверить баланс → списать → создать user_rewards).
-app.post('/api/users/:telegramId/redeem-reward', async (req, res) => {
-  const { telegramId } = req.params;
+app.post('/api/me/redeem-reward', resolveUser, async (req, res) => {
   const { rewardId } = req.body || {};
-  if (!telegramId || telegramId === '0') return res.status(400).json({ error: 'Требуется авторизация' });
   if (!rewardId) return res.status(400).json({ error: 'Укажите rewardId' });
 
   const client = await pool.connect();
@@ -1314,15 +1513,15 @@ app.post('/api/users/:telegramId/redeem-reward', async (req, res) => {
     }
 
     const pendingRes = await client.query(
-      "SELECT id FROM user_rewards WHERE telegram_id = $1 AND status = 'pending'",
-      [telegramId]
+      "SELECT id FROM user_rewards WHERE user_id = $1 AND status = 'pending'",
+      [req.userId]
     );
     if (pendingRes.rows.length > 0) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'У вас уже есть активная награда — добавьте заказ, чтобы получить её' });
     }
 
-    const userRes = await client.query('SELECT points FROM users WHERE telegram_id = $1', [telegramId]);
+    const userRes = await client.query('SELECT points FROM users WHERE id = $1', [req.userId]);
     const userRow = userRes.rows[0];
     if (!userRow) {
       await client.query('ROLLBACK');
@@ -1334,13 +1533,16 @@ app.post('/api/users/:telegramId/redeem-reward', async (req, res) => {
     }
 
     await client.query(
-      'UPDATE users SET points = points - $1, updated_at = now() WHERE telegram_id = $2',
-      [reward.points_cost, telegramId]
+      'UPDATE users SET points = points - $1, updated_at = now() WHERE id = $2',
+      [reward.points_cost, req.userId]
     );
 
+    // telegram_id — только если вход был через Telegram (req.telegramId
+    // ставит resolveUser); для телефонного входа NULL, достаточно user_id
+    // (user_rewards.telegram_id теперь nullable, см. миграцию 028).
     await client.query(
-      "INSERT INTO user_rewards (telegram_id, reward_id, status) VALUES ($1, $2, 'pending')",
-      [telegramId, rewardId]
+      "INSERT INTO user_rewards (user_id, telegram_id, reward_id, status) VALUES ($1, $2, $3, 'pending')",
+      [req.userId, req.telegramId || null, rewardId]
     );
 
     await client.query('COMMIT');
