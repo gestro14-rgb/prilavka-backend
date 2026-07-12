@@ -83,7 +83,7 @@ function toProductDTO(row) {
     bg: row.bg,
     category: row.category,
     badge: row.badge_type
-      ? { type: row.badge_type, label: row.badge_label }
+      ? { type: row.badge_type, label: row.badge_label, color: row.badge_color || null }
       : null,
     composition: row.composition,
     suppliers: row.suppliers,
@@ -1485,8 +1485,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
   try {
     await query(
       `INSERT INTO products
-        (id, title, price, weight, emoji, bg, category, badge_type, badge_label, composition, suppliers, pricing, is_active, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+        (id, title, price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
       [
         p.id,
         p.title,
@@ -1497,6 +1497,7 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
         p.category,
         p.badge?.type || null,
         p.badge?.label || null,
+        p.badge?.color || null,
         JSON.stringify(p.composition || []),
         JSON.stringify(p.suppliers || []),
         JSON.stringify(p.pricing || []),
@@ -1538,18 +1539,19 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         category = $6,
         badge_type = $7,
         badge_label = $8,
-        composition = $9,
-        suppliers = $10,
-        pricing = $11,
-        is_active = $12,
-        sort_order = $13,
-        image_url = $14,
-        is_bundle = $15,
-        subcategory_id = $16,
-        nutrition = $17,
-        home_image_url = $18,
+        badge_color = $9,
+        composition = $10,
+        suppliers = $11,
+        pricing = $12,
+        is_active = $13,
+        sort_order = $14,
+        image_url = $15,
+        is_bundle = $16,
+        subcategory_id = $17,
+        nutrition = $18,
+        home_image_url = $19,
         updated_at = now()
-       WHERE id = $19`,
+       WHERE id = $20`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -1559,6 +1561,7 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         p.category ?? cur.category,
         p.badge ? p.badge.type : (p.badge === null ? null : cur.badge_type),
         p.badge ? p.badge.label : (p.badge === null ? null : cur.badge_label),
+        p.badge ? (p.badge.color || null) : (p.badge === null ? null : cur.badge_color),
         p.composition !== undefined ? JSON.stringify(p.composition) : JSON.stringify(cur.composition),
         p.suppliers !== undefined ? JSON.stringify(p.suppliers) : JSON.stringify(cur.suppliers),
         p.pricing !== undefined ? JSON.stringify(p.pricing) : JSON.stringify(cur.pricing),
