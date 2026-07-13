@@ -76,6 +76,10 @@ function getSetting(key) {
 function toProductDTO(row) {
   return {
     id: row.id,
+    // Свободно переименовываемый человекочитаемый идентификатор — независим
+    // от id (см. migration 030), который остаётся неизменным опорой для
+    // reviews/набор_состав/home_product_shelves и orders.items (JSON-снимок).
+    slug: row.slug || row.id,
     title: row.title,
     price: row.price,
     weight: row.weight,
@@ -1690,10 +1694,11 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
   try {
     await query(
       `INSERT INTO products
-        (id, title, price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
+        (id, slug, title, price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
       [
         p.id,
+        p.slug || p.id,
         p.title,
         p.price,
         p.weight || '',
@@ -1721,7 +1726,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
   } catch (e) {
     console.error(e);
     if (e.code === '23505') {
-      return res.status(409).json({ error: 'Товар с таким id уже существует' });
+      const field = e.constraint === 'products_slug_key' ? 'slug' : 'id';
+      return res.status(409).json({ error: `Товар с таким ${field} уже существует` });
     }
     res.status(500).json({ error: 'Ошибка сервера' });
   }
@@ -1757,8 +1763,9 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         subcategory_id = $18,
         nutrition = $19,
         home_image_url = $20,
+        slug = $21,
         updated_at = now()
-       WHERE id = $21`,
+       WHERE id = $22`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -1782,6 +1789,9 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
           ? (p.nutrition ? JSON.stringify(p.nutrition) : null)
           : (cur.nutrition ? JSON.stringify(cur.nutrition) : null),
         p.homeImageUrl !== undefined ? (p.homeImageUrl || null) : (cur.home_image_url || null),
+        // slug — свободно переименовываемый идентификатор (migration 030),
+        // products.id этим PUT никогда не трогает и не может.
+        p.slug || cur.slug || cur.id,
         req.params.id,
       ]
     );
@@ -1789,6 +1799,9 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
     res.json(toProductDTO(result.rows[0]));
   } catch (e) {
     console.error(e);
+    if (e.code === '23505') {
+      return res.status(409).json({ error: 'Товар с таким slug уже существует' });
+    }
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
