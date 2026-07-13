@@ -1691,6 +1691,13 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
   if (!p.id || !p.title || p.price == null || !p.category) {
     return res.status(400).json({ error: 'Обязательные поля: id, title, price, category' });
   }
+  // id — внутренний опорный ключ (на него ссылаются reviews/набор_состав/
+  // home_product_shelves и orders.items), после создания не меняется нигде
+  // в системе — поэтому здесь, а не только в подсказке формы на фронте,
+  // проверяем формат: латиница, цифры, дефис, без пробелов и без кириллицы.
+  if (!/^[a-z0-9-]+$/.test(p.id)) {
+    return res.status(400).json({ error: 'ID должен содержать только латинские буквы, цифры и дефис, без пробелов' });
+  }
   try {
     await query(
       `INSERT INTO products
