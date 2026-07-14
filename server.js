@@ -475,10 +475,15 @@ app.get('/api/catalog', async (req, res) => {
     const [categoriesRes, subcatsRes, productsRes, reviewsRes, reviewStatsRes, deliveriesRes, compositionsRes, productRatingsRes, homeShelvesRes] = await Promise.all([
       query('SELECT * FROM categories ORDER BY sort_order ASC'),
       query('SELECT * FROM subcategories ORDER BY category_id, sort_order ASC'),
+      // Группировка по подкатегории сохраняется, но внутри неё (и там, где
+      // подкатегории вовсе нет — например, у "Наборы") решает sort_order
+      // самого товара, а не алфавит: раньше p.sort_order здесь не
+      // участвовал вообще, поэтому ручной порядок из ProductForm ни на что
+      // не влиял в каталоге приложения.
       query(`SELECT p.* FROM products p
              LEFT JOIN subcategories sc ON p.subcategory_id = sc.id
              WHERE p.is_active = true
-             ORDER BY sc.sort_order ASC NULLS LAST, p.title ASC`),
+             ORDER BY sc.sort_order ASC NULLS LAST, p.sort_order ASC, p.title ASC`),
       // Новые сверху. У reviews нет created_at — id (SERIAL) монотонно растёт
       // с вставкой, так что id DESC надёжно даёт порядок "новые первые".
       query("SELECT * FROM reviews WHERE status = 'published' ORDER BY id DESC"),
