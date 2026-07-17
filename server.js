@@ -15,6 +15,9 @@ app.use(express.json());
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const YANDEX_GEOCODER_API_KEY = process.env.YANDEX_GEOCODER_API_KEY || '';
+// Suggest API — отдельный от Geocoder сервис в кабинете Яндекса, свой ключ
+// (геокодер-ключ им не подходит). Автоподсказки при вводе адреса.
+const YANDEX_SUGGEST_API_KEY = process.env.YANDEX_SUGGEST_API_KEY || '';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID || '';
 // Публичный URL мини-приложения — для web_app-кнопки в пуше "оставьте отзыв".
@@ -330,6 +333,37 @@ async function geocodeAddress(address) {
     lng: parseFloat(lngStr),
     formatted: geoObject.metaDataProperty?.GeocoderMetaData?.text || address,
   };
+}
+
+// Автоподсказки при вводе адреса — Yandex Suggest API (v1/suggest), не
+// путать с geocodeAddress выше: тот переводит уже готовый адрес в
+// координаты, этот — достраивает варианты по неполному тексту на каждую
+// пару-тройку введённых символов. types=geo — только топонимы/адреса, без
+// организаций/бизнесов, которые Suggest тоже умеет отдавать.
+// title — часть, которая продолжает ввод пользователя; subtitle — контекст
+// (город/регион), объединяем в value — то, что реально подставится в поле.
+async function suggestAddress(text) {
+  if (!YANDEX_SUGGEST_API_KEY) {
+    throw new Error('YANDEX_SUGGEST_API_KEY не настроен на сервере');
+  }
+  const url = new URL('https://suggest-maps.yandex.ru/v1/suggest');
+  url.searchParams.set('apikey', YANDEX_SUGGEST_API_KEY);
+  url.searchParams.set('text', text);
+  url.searchParams.set('lang', 'ru_RU');
+  url.searchParams.set('types', 'geo');
+  url.searchParams.set('results', '5');
+
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Suggest API вернул ошибку: ${res.status}`);
+  }
+  const data = await res.json();
+  const results = Array.isArray(data?.results) ? data.results : [];
+  return results.map((r) => {
+    const label = r.title?.text || '';
+    const sublabel = r.subtitle?.text || '';
+    return { label, sublabel, value: sublabel ? `${label}, ${sublabel}` : label };
+  });
 }
 
 // Проверка "точка внутри многоугольника" (алгоритм ray-casting).
@@ -738,6 +772,23 @@ app.post('/api/check-zone', async (req, res) => {
       zone: matchedZone ? matchedZone.label : null,
       point,
     });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message || 'Ошибка сервера' });
+  }
+});
+
+// Автоподсказки для поля "Улица и дом" (CheckoutAddress.jsx) — дергается с
+// debounce на каждый ввод, поэтому короткий текст не гоняет внешний API зря.
+// Прокси нужен, чтобы серверный YANDEX_SUGGEST_API_KEY не светился в браузере.
+app.get('/api/address-suggest', async (req, res) => {
+  const text = (req.query.query || '').toString().trim();
+  if (text.length < 3) {
+    return res.json({ suggestions: [] });
+  }
+  try {
+    const suggestions = await suggestAddress(text);
+    res.json({ suggestions });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message || 'Ошибка сервера' });
