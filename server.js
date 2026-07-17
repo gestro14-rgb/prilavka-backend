@@ -118,8 +118,11 @@ function toBundleItemDTO(row) {
   };
 }
 
-function toReviewDTO(row) {
+// votedReviewIds — Set id отзывов, за которые уже проголосовал текущий
+// пользователь (см. resolveUserOptional) — пусто/не передан для анонима.
+function toReviewDTO(row, votedReviewIds) {
   return {
+    id: row.id,
     name: row.name,
     area: row.area,
     stars: row.stars,
@@ -130,7 +133,20 @@ function toReviewDTO(row) {
     // avatar_url хранит только Telegram file_id (не протухает, не содержит
     // токена) — резолвится в реальную картинку через прокси-эндпоинт ниже.
     avatarUrl: row.avatar_url ? `${BACKEND_PUBLIC_URL}/api/avatar/${row.avatar_url}` : null,
+    helpfulCount: row.helpful_count ?? 0,
+    helpfulVotedByMe: votedReviewIds ? votedReviewIds.has(row.id) : false,
   };
+}
+
+// Множество id отзывов из reviewIds, за которые уже проголосовал userId —
+// один лёгкий запрос вместо JOIN в каждом из мест, отдающих список отзывов.
+async function loadHelpfulVotedIds(userId, reviewIds) {
+  if (!userId || reviewIds.length === 0) return new Set();
+  const result = await query(
+    'SELECT review_id FROM review_helpful_votes WHERE user_id = $1 AND review_id = ANY($2)',
+    [userId, reviewIds]
+  );
+  return new Set(result.rows.map((r) => r.review_id));
 }
 
 // Агрегат для сводки рейтинга/гистограммы/чипов-фильтров — переиспользуется
@@ -255,6 +271,36 @@ async function resolveUser(req, res, next) {
   } catch (e) {
     return res.status(401).json({ error: 'Недействительный или просроченный токен' });
   }
+}
+
+// Как resolveUser, но для публичных GET-эндпоинтов: отсутствующий/битый
+// токен не 401-ит запрос, а просто оставляет req.userId = null (аноним) —
+// нужно, чтобы одна и та же выдача отзывов работала и без входа, и с ним
+// (помечая helpfulVotedByMe для тех, кто уже проголосовал).
+async function resolveUserOptional(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  req.userId = null;
+  if (!token) return next();
+
+  try {
+    let row;
+    if (JWT_SHAPE.test(token)) {
+      const payload = jwt.verify(token, JWT_SECRET);
+      const userRes = await query('SELECT id FROM users WHERE id = $1', [payload.sub]);
+      row = userRes.rows[0];
+    } else {
+      const verified = verifyTelegramInitData(token, TELEGRAM_BOT_TOKEN);
+      if (verified) {
+        row = await upsertUser(verified.user.id, verified.user.username, verified.user.first_name);
+      }
+    }
+    if (row) req.userId = row.id;
+  } catch (e) {
+    // Битый/просроченный токен на публичном эндпоинте — деградируем до
+    // анонима, а не 401, чтобы список отзывов не переставал грузиться.
+  }
+  next();
 }
 
 // Геокодирование адреса через Яндекс Geocoder HTTP API.
@@ -470,7 +516,7 @@ app.get('/api/districts', async (req, res) => {
 // Весь каталог
 
 // Весь каталог (категории + товары + отзывы + доставки) — то, что раньше было в products.js
-app.get('/api/catalog', async (req, res) => {
+app.get('/api/catalog', resolveUserOptional, async (req, res) => {
   try {
     const [categoriesRes, subcatsRes, productsRes, reviewsRes, reviewStatsRes, deliveriesRes, compositionsRes, productRatingsRes, homeShelvesRes] = await Promise.all([
       query('SELECT * FROM categories ORDER BY sort_order ASC'),
@@ -512,6 +558,8 @@ app.get('/api/catalog', async (req, res) => {
       ),
     ]);
 
+    const votedReviewIds = await loadHelpfulVotedIds(req.userId, reviewsRes.rows.map((r) => r.id));
+
     const compositionsByProduct = {};
     for (const row of compositionsRes.rows) {
       if (!compositionsByProduct[row.product_id]) compositionsByProduct[row.product_id] = [];
@@ -543,7 +591,7 @@ app.get('/api/catalog', async (req, res) => {
         bundleComposition: compositionsByProduct[row.id] ?? null,
         rating: ratingByProduct[row.id] ?? null,
       })),
-      reviews: reviewsRes.rows.map(toReviewDTO),
+      reviews: reviewsRes.rows.map((row) => toReviewDTO(row, votedReviewIds)),
       reviewStats: toReviewStatsDTO(reviewStatsRes.rows[0]),
       deliveries: deliveriesRes.rows.map((d) => ({
         emoji: d.emoji,
@@ -569,7 +617,7 @@ app.get('/api/catalog', async (req, res) => {
 // Полный список одобренных отзывов с пагинацией — для страницы /reviews
 // ("Все отзывы"). /api/catalog отдаёт их же, но без пагинации — там это
 // нормально, пока Home показывает только первые 4.
-app.get('/api/reviews', async (req, res) => {
+app.get('/api/reviews', resolveUserOptional, async (req, res) => {
   const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
   const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
 
@@ -603,8 +651,10 @@ app.get('/api/reviews', async (req, res) => {
       query(REVIEW_STATS_QUERY),
     ]);
     const hasMore = listRes.rows.length > limit;
+    const pageRows = listRes.rows.slice(0, limit);
+    const votedReviewIds = await loadHelpfulVotedIds(req.userId, pageRows.map((r) => r.id));
     res.json({
-      reviews: listRes.rows.slice(0, limit).map(toReviewDTO),
+      reviews: pageRows.map((row) => toReviewDTO(row, votedReviewIds)),
       hasMore,
       stats: toReviewStatsDTO(statsRes.rows[0]),
     });
@@ -616,7 +666,7 @@ app.get('/api/reviews', async (req, res) => {
 
 // Отзывы на конкретный товар — для секции "Отзывы на этот товар" в карточке
 // товара (ProductDetail). Тот же toReviewDTO, что и у общего списка /api/reviews.
-app.get('/api/products/:id/reviews', async (req, res) => {
+app.get('/api/products/:id/reviews', resolveUserOptional, async (req, res) => {
   const productId = req.params.id;
   const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
   const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
@@ -632,8 +682,10 @@ app.get('/api/products/:id/reviews', async (req, res) => {
       ),
     ]);
     const hasMore = listRes.rows.length > limit;
+    const pageRows = listRes.rows.slice(0, limit);
+    const votedReviewIds = await loadHelpfulVotedIds(req.userId, pageRows.map((r) => r.id));
     res.json({
-      reviews: listRes.rows.slice(0, limit).map(toReviewDTO),
+      reviews: pageRows.map((row) => toReviewDTO(row, votedReviewIds)),
       hasMore,
       count: statsRes.rows[0].count,
       avgStars: Math.round(statsRes.rows[0].avg_stars * 10) / 10,
@@ -1556,6 +1608,58 @@ app.post('/api/me/redeem-reward', resolveUser, async (req, res) => {
 
     await client.query('COMMIT');
     res.json({ ok: true, pointsLeft: userRow.points - reward.points_cost });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  } finally {
+    client.release();
+  }
+});
+
+// Голос "Полезно" на отзыве (транзакция: вставить голос → если реально
+// вставился (не повторный) — инкрементнуть денормализованный счётчик).
+// ON CONFLICT DO NOTHING на уникальном (review_id, user_id) — повторный клик
+// не 400-ит, а тихо возвращает текущее состояние (alreadyVoted: true).
+app.post('/api/me/reviews/:id/helpful', resolveUser, async (req, res) => {
+  const reviewId = Number(req.params.id);
+  if (!Number.isInteger(reviewId)) {
+    return res.status(400).json({ error: 'Некорректный id отзыва' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const insertRes = await client.query(
+      `INSERT INTO review_helpful_votes (review_id, user_id) VALUES ($1, $2)
+       ON CONFLICT (review_id, user_id) DO NOTHING
+       RETURNING id`,
+      [reviewId, req.userId]
+    );
+
+    let helpfulCount;
+    if (insertRes.rows.length > 0) {
+      const updateRes = await client.query(
+        'UPDATE reviews SET helpful_count = helpful_count + 1 WHERE id = $1 RETURNING helpful_count',
+        [reviewId]
+      );
+      if (updateRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Отзыв не найден' });
+      }
+      helpfulCount = updateRes.rows[0].helpful_count;
+    } else {
+      const currentRes = await client.query('SELECT helpful_count FROM reviews WHERE id = $1', [reviewId]);
+      if (currentRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Отзыв не найден' });
+      }
+      helpfulCount = currentRes.rows[0].helpful_count;
+    }
+
+    await client.query('COMMIT');
+    res.json({ ok: true, helpfulCount, alreadyVoted: insertRes.rows.length === 0 });
   } catch (e) {
     await client.query('ROLLBACK');
     console.error(e);
