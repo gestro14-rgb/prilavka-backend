@@ -3508,20 +3508,29 @@ app.put('/api/admin/settings/:key', requireAuth, async (req, res) => {
   }
 });
 
+// fixedCostsMonthly — не отдельная колонка (см. migrations/034), считается
+// суммой трёх статей на каждое чтение, чтобы не хранить то же число дважды.
 function toPricingSettingsDTO(row) {
+  const rentMonthly = Number(row.rent_monthly);
+  const salaryMonthly = Number(row.salary_monthly);
+  const otherCostsMonthly = Number(row.other_costs_monthly);
   return {
-    fixedCostsMonthly: Number(row.fixed_costs_monthly),
+    rentMonthly,
+    salaryMonthly,
+    otherCostsMonthly,
+    fixedCostsMonthly: rentMonthly + salaryMonthly + otherCostsMonthly,
     plannedSalesMonthly: Number(row.planned_sales_monthly),
     packagingCostPerUnit: Number(row.packaging_cost_per_unit),
     acquiringPercent: Number(row.acquiring_percent),
     defaultMarginPercent: Number(row.default_margin_percent),
+    wastePercent: Number(row.waste_percent),
   };
 }
 
-// Настройки модуля ценообразования — singleton-таблица (см. migrations/032),
-// ровно одна строка, поэтому GET просто берёт LIMIT 1, а PUT обновляет её
-// целиком одной формой (не по одному полю, как /api/admin/settings — тут
-// все 5 чисел составляют один взаимосвязанный расчёт, порознь их сохранять
+// Настройки модуля ценообразования — singleton-таблица (см. migrations/032,
+// 034), ровно одна строка, поэтому GET просто берёт LIMIT 1, а PUT обновляет
+// её целиком одной формой (не по одному полю, как /api/admin/settings — тут
+// все числа составляют один взаимосвязанный расчёт, порознь сохранять
 // нет смысла).
 app.get('/api/admin/pricing-settings', requireAuth, async (req, res) => {
   try {
@@ -3536,19 +3545,30 @@ app.get('/api/admin/pricing-settings', requireAuth, async (req, res) => {
 
 app.put('/api/admin/pricing-settings', requireAuth, async (req, res) => {
   const p = req.body || {};
-  const fields = ['fixedCostsMonthly', 'plannedSalesMonthly', 'packagingCostPerUnit', 'acquiringPercent', 'defaultMarginPercent'];
+  const fields = [
+    'rentMonthly', 'salaryMonthly', 'otherCostsMonthly', 'plannedSalesMonthly',
+    'packagingCostPerUnit', 'acquiringPercent', 'defaultMarginPercent', 'wastePercent',
+  ];
   for (const f of fields) {
     if (typeof p[f] !== 'number' || Number.isNaN(p[f]) || p[f] < 0) {
       return res.status(400).json({ error: `Поле ${f} должно быть неотрицательным числом` });
     }
   }
+  if (p.wastePercent >= 100) {
+    return res.status(400).json({ error: 'Процент списаний должен быть меньше 100' });
+  }
   try {
     const result = await query(
       `UPDATE pricing_settings SET
-        fixed_costs_monthly = $1, planned_sales_monthly = $2, packaging_cost_per_unit = $3,
-        acquiring_percent = $4, default_margin_percent = $5, updated_at = now()
+        rent_monthly = $1, salary_monthly = $2, other_costs_monthly = $3,
+        planned_sales_monthly = $4, packaging_cost_per_unit = $5,
+        acquiring_percent = $6, default_margin_percent = $7, waste_percent = $8,
+        updated_at = now()
        RETURNING *`,
-      [p.fixedCostsMonthly, p.plannedSalesMonthly, p.packagingCostPerUnit, p.acquiringPercent, p.defaultMarginPercent]
+      [
+        p.rentMonthly, p.salaryMonthly, p.otherCostsMonthly, p.plannedSalesMonthly,
+        p.packagingCostPerUnit, p.acquiringPercent, p.defaultMarginPercent, p.wastePercent,
+      ]
     );
     res.json(toPricingSettingsDTO(result.rows[0]));
   } catch (e) {
