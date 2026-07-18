@@ -110,6 +110,13 @@ function toProductDTO(row) {
   };
 }
 
+// purchase_price — закупочная цена, вход для модуля ценообразования.
+// Намеренно НЕ в toProductDTO: это себестоимость, а toProductDTO отдаёт и
+// публичный /api/catalog — админские product-роуты подмешивают поле сами.
+function toAdminProductDTO(row) {
+  return { ...toProductDTO(row), purchasePrice: row.purchase_price != null ? Number(row.purchase_price) : null };
+}
+
 function toBundleItemDTO(row) {
   return {
     id: row.id,
@@ -1820,7 +1827,7 @@ app.post('/api/admin/upload-image', requireAuth, upload.single('file'), (req, re
 app.get('/api/admin/products', requireAuth, async (req, res) => {
   try {
     const result = await query('SELECT * FROM products ORDER BY sort_order ASC, created_at ASC');
-    res.json(result.rows.map(toProductDTO));
+    res.json(result.rows.map(toAdminProductDTO));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
@@ -1836,7 +1843,7 @@ app.get('/api/admin/products/:id', requireAuth, async (req, res) => {
     ]);
     if (!productRes.rows[0]) return res.status(404).json({ error: 'Товар не найден' });
     res.json({
-      ...toProductDTO(productRes.rows[0]),
+      ...toAdminProductDTO(productRes.rows[0]),
       bundleComposition: compositionRes.rows.map(toBundleItemDTO),
     });
   } catch (e) {
@@ -1861,8 +1868,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
   try {
     await query(
       `INSERT INTO products
-        (id, slug, title, price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+        (id, slug, title, price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
       [
         p.id,
         p.slug || p.id,
@@ -1886,10 +1893,11 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
         p.subcategoryId || null,
         p.nutrition ? JSON.stringify(p.nutrition) : null,
         p.homeImageUrl || null,
+        p.purchasePrice != null && p.purchasePrice !== '' ? p.purchasePrice : null,
       ]
     );
     const result = await query('SELECT * FROM products WHERE id = $1', [p.id]);
-    res.status(201).json(toProductDTO(result.rows[0]));
+    res.status(201).json(toAdminProductDTO(result.rows[0]));
   } catch (e) {
     console.error(e);
     if (e.code === '23505') {
@@ -1931,8 +1939,9 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         nutrition = $19,
         home_image_url = $20,
         slug = $21,
+        purchase_price = $22,
         updated_at = now()
-       WHERE id = $22`,
+       WHERE id = $23`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -1959,11 +1968,12 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         // slug — свободно переименовываемый идентификатор (migration 030),
         // products.id этим PUT никогда не трогает и не может.
         p.slug || cur.slug || cur.id,
+        p.purchasePrice !== undefined ? (p.purchasePrice !== '' ? p.purchasePrice : null) : cur.purchase_price,
         req.params.id,
       ]
     );
     const result = await query('SELECT * FROM products WHERE id = $1', [req.params.id]);
-    res.json(toProductDTO(result.rows[0]));
+    res.json(toAdminProductDTO(result.rows[0]));
   } catch (e) {
     console.error(e);
     if (e.code === '23505') {
@@ -3492,6 +3502,55 @@ app.put('/api/admin/settings/:key', requireAuth, async (req, res) => {
     }
     settingsCache[key] = String(value).trim();
     res.json(result.rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+function toPricingSettingsDTO(row) {
+  return {
+    fixedCostsMonthly: Number(row.fixed_costs_monthly),
+    plannedSalesMonthly: Number(row.planned_sales_monthly),
+    packagingCostPerUnit: Number(row.packaging_cost_per_unit),
+    acquiringPercent: Number(row.acquiring_percent),
+    defaultMarginPercent: Number(row.default_margin_percent),
+  };
+}
+
+// Настройки модуля ценообразования — singleton-таблица (см. migrations/032),
+// ровно одна строка, поэтому GET просто берёт LIMIT 1, а PUT обновляет её
+// целиком одной формой (не по одному полю, как /api/admin/settings — тут
+// все 5 чисел составляют один взаимосвязанный расчёт, порознь их сохранять
+// нет смысла).
+app.get('/api/admin/pricing-settings', requireAuth, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM pricing_settings LIMIT 1');
+    if (!result.rows[0]) return res.status(404).json({ error: 'Настройки ценообразования не найдены' });
+    res.json(toPricingSettingsDTO(result.rows[0]));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.put('/api/admin/pricing-settings', requireAuth, async (req, res) => {
+  const p = req.body || {};
+  const fields = ['fixedCostsMonthly', 'plannedSalesMonthly', 'packagingCostPerUnit', 'acquiringPercent', 'defaultMarginPercent'];
+  for (const f of fields) {
+    if (typeof p[f] !== 'number' || Number.isNaN(p[f]) || p[f] < 0) {
+      return res.status(400).json({ error: `Поле ${f} должно быть неотрицательным числом` });
+    }
+  }
+  try {
+    const result = await query(
+      `UPDATE pricing_settings SET
+        fixed_costs_monthly = $1, planned_sales_monthly = $2, packaging_cost_per_unit = $3,
+        acquiring_percent = $4, default_margin_percent = $5, updated_at = now()
+       RETURNING *`,
+      [p.fixedCostsMonthly, p.plannedSalesMonthly, p.packagingCostPerUnit, p.acquiringPercent, p.defaultMarginPercent]
+    );
+    res.json(toPricingSettingsDTO(result.rows[0]));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
