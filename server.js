@@ -3524,6 +3524,9 @@ function toPricingSettingsDTO(row) {
     acquiringPercent: Number(row.acquiring_percent),
     defaultMarginPercent: Number(row.default_margin_percent),
     wastePercent: Number(row.waste_percent),
+    // Nullable намеренно (см. migrations/035) — null означает "не настроено",
+    // а не "1 позиция на заказ".
+    avgItemsPerOrder: row.avg_items_per_order != null ? Number(row.avg_items_per_order) : null,
   };
 }
 
@@ -3557,17 +3560,26 @@ app.put('/api/admin/pricing-settings', requireAuth, async (req, res) => {
   if (p.wastePercent >= 100) {
     return res.status(400).json({ error: 'Процент списаний должен быть меньше 100' });
   }
+  // avgItemsPerOrder — единственное необязательное поле формы (см.
+  // migrations/035): null допускается ("ещё не настроено"), но если
+  // прислали что-то — это обязано быть целое число ≥ 1, не 0/дробь/строка.
+  if (p.avgItemsPerOrder !== null && p.avgItemsPerOrder !== undefined) {
+    if (typeof p.avgItemsPerOrder !== 'number' || !Number.isInteger(p.avgItemsPerOrder) || p.avgItemsPerOrder < 1) {
+      return res.status(400).json({ error: 'Поле avgItemsPerOrder должно быть целым числом не меньше 1' });
+    }
+  }
   try {
     const result = await query(
       `UPDATE pricing_settings SET
         rent_monthly = $1, salary_monthly = $2, other_costs_monthly = $3,
         planned_sales_monthly = $4, packaging_cost_per_unit = $5,
         acquiring_percent = $6, default_margin_percent = $7, waste_percent = $8,
-        updated_at = now()
+        avg_items_per_order = $9, updated_at = now()
        RETURNING *`,
       [
         p.rentMonthly, p.salaryMonthly, p.otherCostsMonthly, p.plannedSalesMonthly,
         p.packagingCostPerUnit, p.acquiringPercent, p.defaultMarginPercent, p.wastePercent,
+        p.avgItemsPerOrder ?? null,
       ]
     );
     res.json(toPricingSettingsDTO(result.rows[0]));
