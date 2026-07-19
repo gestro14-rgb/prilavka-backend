@@ -122,6 +122,22 @@ function toAdminProductDTO(row) {
     // Текстовое weight не участвует в расчётах (см. migrations/036).
     pricingUnit: row.pricing_unit || 'piece',
     weightKg: row.weight_kg != null ? Number(row.weight_kg) : null,
+    // Индивидуальная маржа товара — верхний уровень приоритета маржи
+    // (migrations/038): товар → подкатегория → глобальная настройка.
+    individualMarginPercent: row.individual_margin_percent != null ? Number(row.individual_margin_percent) : null,
+  };
+}
+
+function toSubcategoryDTO(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    categoryId: row.category_id,
+    slug: row.slug,
+    sortOrder: row.sort_order,
+    // Второй уровень приоритета маржи (migrations/038); null — у
+    // подкатегории нет своей маржи, действует глобальная настройка.
+    targetMarginPercent: row.target_margin_percent != null ? Number(row.target_margin_percent) : null,
   };
 }
 
@@ -1884,10 +1900,15 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
     const weightKg = pricingUnit === 'kg' && p.weightKg != null && p.weightKg !== '' && Number(p.weightKg) > 0
       ? Number(p.weightKg)
       : null;
+    // Индивидуальная маржа (migrations/038) — верхний уровень приоритета;
+    // 0 — валидное значение, "не задано" — только null/пусто.
+    const individualMargin = p.individualMarginPercent != null && p.individualMarginPercent !== '' && Number(p.individualMarginPercent) >= 0
+      ? Number(p.individualMarginPercent)
+      : null;
     await query(
       `INSERT INTO products
-        (id, slug, title, price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
+        (id, slug, title, price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg, individual_margin_percent)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
       [
         p.id,
         p.slug || p.id,
@@ -1914,6 +1935,7 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
         p.purchasePrice != null && p.purchasePrice !== '' ? p.purchasePrice : null,
         pricingUnit,
         weightKg,
+        individualMargin,
       ]
     );
     const result = await query('SELECT * FROM products WHERE id = $1', [p.id]);
@@ -1946,6 +1968,12 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
     const weightKg = pricingUnit === 'kg' && weightKgRaw != null && weightKgRaw !== '' && Number(weightKgRaw) > 0
       ? Number(weightKgRaw)
       : null;
+    // Индивидуальная маржа (migrations/038): undefined — не трогаем,
+    // ''/null — сброс на приоритет подкатегория → глобальная.
+    const individualMarginRaw = p.individualMarginPercent !== undefined ? p.individualMarginPercent : cur.individual_margin_percent;
+    const individualMargin = individualMarginRaw != null && individualMarginRaw !== '' && Number(individualMarginRaw) >= 0
+      ? Number(individualMarginRaw)
+      : null;
 
     await query(
       `UPDATE products SET
@@ -1973,8 +2001,9 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         purchase_price = $22,
         pricing_unit = $23,
         weight_kg = $24,
+        individual_margin_percent = $25,
         updated_at = now()
-       WHERE id = $25`,
+       WHERE id = $26`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -2004,6 +2033,7 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         p.purchasePrice !== undefined ? (p.purchasePrice !== '' ? p.purchasePrice : null) : cur.purchase_price,
         pricingUnit,
         weightKg,
+        individualMargin,
         req.params.id,
       ]
     );
@@ -2153,29 +2183,6 @@ app.post('/api/admin/categories', requireAuth, async (req, res) => {
   }
 });
 
-// Целевая маржа категории (migrations/037) — единственное редактируемое
-// поле категории помимо порядка: null означает "использовать глобальную
-// маржу из pricing_settings". Отдаём сырую строку таблицы, как GET/reorder.
-app.put('/api/admin/categories/:id', requireAuth, async (req, res) => {
-  const { targetMarginPercent } = req.body || {};
-  if (targetMarginPercent !== null && targetMarginPercent !== undefined) {
-    if (typeof targetMarginPercent !== 'number' || Number.isNaN(targetMarginPercent) || targetMarginPercent < 0) {
-      return res.status(400).json({ error: 'targetMarginPercent должен быть неотрицательным числом или null' });
-    }
-  }
-  try {
-    const result = await query(
-      'UPDATE categories SET target_margin_percent = $1 WHERE id = $2 RETURNING *',
-      [targetMarginPercent ?? null, req.params.id]
-    );
-    if (!result.rows[0]) return res.status(404).json({ error: 'Категория не найдена' });
-    res.json(result.rows[0]);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Ошибка сервера' });
-  }
-});
-
 app.delete('/api/admin/categories/:id', requireAuth, async (req, res) => {
   try {
     const result = await query('DELETE FROM categories WHERE id = $1', [req.params.id]);
@@ -2237,13 +2244,7 @@ app.put('/api/admin/categories/reorder', requireAuth, async (req, res) => {
 app.get('/api/admin/subcategories', requireAuth, async (req, res) => {
   try {
     const result = await query('SELECT * FROM subcategories ORDER BY category_id, sort_order ASC');
-    res.json(result.rows.map((sc) => ({
-      id: sc.id,
-      name: sc.name,
-      categoryId: sc.category_id,
-      slug: sc.slug,
-      sortOrder: sc.sort_order,
-    })));
+    res.json(result.rows.map(toSubcategoryDTO));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
@@ -2261,8 +2262,7 @@ app.post('/api/admin/subcategories', requireAuth, async (req, res) => {
       'INSERT INTO subcategories (name, category_id, slug, sort_order) VALUES ($1, $2, $3, $4) RETURNING *',
       [String(name).trim(), categoryId, slug, Number(sortOrder) || 0]
     );
-    const sc = result.rows[0];
-    res.status(201).json({ id: sc.id, name: sc.name, categoryId: sc.category_id, slug: sc.slug, sortOrder: sc.sort_order });
+    res.status(201).json(toSubcategoryDTO(result.rows[0]));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
@@ -2270,7 +2270,14 @@ app.post('/api/admin/subcategories', requireAuth, async (req, res) => {
 });
 
 app.put('/api/admin/subcategories/:id', requireAuth, async (req, res) => {
-  const { name, sortOrder, categoryId } = req.body || {};
+  const { name, sortOrder, categoryId, targetMarginPercent } = req.body || {};
+  // Целевая маржа (migrations/038): null сбрасывает на глобальную настройку,
+  // undefined — поле не трогается.
+  if (targetMarginPercent !== null && targetMarginPercent !== undefined) {
+    if (typeof targetMarginPercent !== 'number' || Number.isNaN(targetMarginPercent) || targetMarginPercent < 0) {
+      return res.status(400).json({ error: 'targetMarginPercent должен быть неотрицательным числом или null' });
+    }
+  }
   try {
     const existing = await query('SELECT * FROM subcategories WHERE id = $1', [req.params.id]);
     if (!existing.rows[0]) return res.status(404).json({ error: 'Подкатегория не найдена' });
@@ -2280,17 +2287,17 @@ app.put('/api/admin/subcategories/:id', requireAuth, async (req, res) => {
       ? newName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-zа-яё0-9-]/gi, '')
       : cur.slug;
     const result = await query(
-      'UPDATE subcategories SET name = $1, slug = $2, sort_order = $3, category_id = $4, updated_at = now() WHERE id = $5 RETURNING *',
+      'UPDATE subcategories SET name = $1, slug = $2, sort_order = $3, category_id = $4, target_margin_percent = $5, updated_at = now() WHERE id = $6 RETURNING *',
       [
         newName,
         newSlug,
         sortOrder !== undefined ? Number(sortOrder) : cur.sort_order,
         categoryId !== undefined ? categoryId : cur.category_id,
+        targetMarginPercent !== undefined ? targetMarginPercent : cur.target_margin_percent,
         req.params.id,
       ]
     );
-    const sc = result.rows[0];
-    res.json({ id: sc.id, name: sc.name, categoryId: sc.category_id, slug: sc.slug, sortOrder: sc.sort_order });
+    res.json(toSubcategoryDTO(result.rows[0]));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
