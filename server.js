@@ -114,7 +114,15 @@ function toProductDTO(row) {
 // Намеренно НЕ в toProductDTO: это себестоимость, а toProductDTO отдаёт и
 // публичный /api/catalog — админские product-роуты подмешивают поле сами.
 function toAdminProductDTO(row) {
-  return { ...toProductDTO(row), purchasePrice: row.purchase_price != null ? Number(row.purchase_price) : null };
+  return {
+    ...toProductDTO(row),
+    purchasePrice: row.purchase_price != null ? Number(row.purchase_price) : null,
+    // 'kg' — purchase_price указана за килограмм, эффективная закупка
+    // упаковки = purchase_price × weight_kg; 'piece' — как есть.
+    // Текстовое weight не участвует в расчётах (см. migrations/036).
+    pricingUnit: row.pricing_unit || 'piece',
+    weightKg: row.weight_kg != null ? Number(row.weight_kg) : null,
+  };
 }
 
 function toBundleItemDTO(row) {
@@ -1865,11 +1873,21 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
   if (!/^[a-z0-9-]+$/.test(p.id)) {
     return res.status(400).json({ error: 'ID должен содержать только латинские буквы, цифры и дефис, без пробелов' });
   }
+  if (p.pricingUnit !== undefined && !['kg', 'piece'].includes(p.pricingUnit)) {
+    return res.status(400).json({ error: "pricingUnit должен быть 'kg' или 'piece'" });
+  }
   try {
+    // weight_kg имеет смысл только при закупке за кг (migrations/036) — при
+    // 'piece' пишем NULL, чтобы в базе не оставался вес, который ни на что
+    // не влияет.
+    const pricingUnit = p.pricingUnit === 'kg' ? 'kg' : 'piece';
+    const weightKg = pricingUnit === 'kg' && p.weightKg != null && p.weightKg !== '' && Number(p.weightKg) > 0
+      ? Number(p.weightKg)
+      : null;
     await query(
       `INSERT INTO products
-        (id, slug, title, price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+        (id, slug, title, price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
       [
         p.id,
         p.slug || p.id,
@@ -1894,6 +1912,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
         p.nutrition ? JSON.stringify(p.nutrition) : null,
         p.homeImageUrl || null,
         p.purchasePrice != null && p.purchasePrice !== '' ? p.purchasePrice : null,
+        pricingUnit,
+        weightKg,
       ]
     );
     const result = await query('SELECT * FROM products WHERE id = $1', [p.id]);
@@ -1911,10 +1931,21 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
 // Обновить товар
 app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
   const p = req.body || {};
+  if (p.pricingUnit !== undefined && !['kg', 'piece'].includes(p.pricingUnit)) {
+    return res.status(400).json({ error: "pricingUnit должен быть 'kg' или 'piece'" });
+  }
   try {
     const existing = await query('SELECT * FROM products WHERE id = $1', [req.params.id]);
     if (!existing.rows[0]) return res.status(404).json({ error: 'Товар не найден' });
     const cur = existing.rows[0];
+
+    // Итоговая единица закупки — из запроса или текущая; вес хранится только
+    // при 'kg' (см. migrations/036), при 'piece' затирается в NULL.
+    const pricingUnit = p.pricingUnit !== undefined ? p.pricingUnit : (cur.pricing_unit || 'piece');
+    const weightKgRaw = p.weightKg !== undefined ? p.weightKg : cur.weight_kg;
+    const weightKg = pricingUnit === 'kg' && weightKgRaw != null && weightKgRaw !== '' && Number(weightKgRaw) > 0
+      ? Number(weightKgRaw)
+      : null;
 
     await query(
       `UPDATE products SET
@@ -1940,8 +1971,10 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         home_image_url = $20,
         slug = $21,
         purchase_price = $22,
+        pricing_unit = $23,
+        weight_kg = $24,
         updated_at = now()
-       WHERE id = $23`,
+       WHERE id = $25`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -1969,6 +2002,8 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         // products.id этим PUT никогда не трогает и не может.
         p.slug || cur.slug || cur.id,
         p.purchasePrice !== undefined ? (p.purchasePrice !== '' ? p.purchasePrice : null) : cur.purchase_price,
+        pricingUnit,
+        weightKg,
         req.params.id,
       ]
     );
@@ -2114,6 +2149,29 @@ app.post('/api/admin/categories', requireAuth, async (req, res) => {
   } catch (e) {
     console.error(e);
     if (e.code === '23505') return res.status(409).json({ error: 'Категория с таким id уже существует' });
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Целевая маржа категории (migrations/037) — единственное редактируемое
+// поле категории помимо порядка: null означает "использовать глобальную
+// маржу из pricing_settings". Отдаём сырую строку таблицы, как GET/reorder.
+app.put('/api/admin/categories/:id', requireAuth, async (req, res) => {
+  const { targetMarginPercent } = req.body || {};
+  if (targetMarginPercent !== null && targetMarginPercent !== undefined) {
+    if (typeof targetMarginPercent !== 'number' || Number.isNaN(targetMarginPercent) || targetMarginPercent < 0) {
+      return res.status(400).json({ error: 'targetMarginPercent должен быть неотрицательным числом или null' });
+    }
+  }
+  try {
+    const result = await query(
+      'UPDATE categories SET target_margin_percent = $1 WHERE id = $2 RETURNING *',
+      [targetMarginPercent ?? null, req.params.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Категория не найдена' });
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
