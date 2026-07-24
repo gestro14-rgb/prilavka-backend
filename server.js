@@ -578,12 +578,136 @@ app.get('/api/districts', async (req, res) => {
 });
 
 
-// Весь каталог
+// ============================================================
+// Автоматический расчёт разбивки "Честная цена" (Поставщику/Логистика/
+// Упаковка/Сервис) для карточки товара, когда админ не заполнил pricing
+// вручную. Формула — инверсия calcPricing из prilavka-admin/src/pricingCalc.js
+// относительно ТЕКУЩЕЙ цены (а не рекомендуемой): что мы "предполагаем" о
+// закупке, чтобы эта формула объясняла уже установленную цену. purchase_price,
+// если он заполнен, приоритетнее — тогда доля фермера берётся напрямую, без
+// подразумеваемого расчёта через маржу.
+// ============================================================
+
+const FAIR_PRICE_SEGMENT_COLORS = ['#2A7A2A', '#C4782A', '#7A5230', '#6B7A3A'];
+// За пределами диапазона цифры выглядят неправдоподобно (см. обсуждение
+// бага с 33% у большинства товаров) — лучше не показать блок вовсе, чем
+// подставить сомнительное число.
+const FAIR_PRICE_MIN_FARMER_PCT = 25;
+const FAIR_PRICE_MAX_FARMER_PCT = 80;
+
+// Дублирует effectivePurchaseCost из prilavka-admin/src/pricingCalc.js —
+// бэкенд и админка разные деплоймые приложения без общего пакета.
+function effectivePurchaseCost({ purchasePrice, pricingUnit, weightKg }) {
+  if (purchasePrice == null || purchasePrice === '') return null;
+  if (pricingUnit === 'kg') {
+    const w = Number(weightKg);
+    if (!Number.isFinite(w) || w <= 0) return null;
+    return Number(purchasePrice) * w;
+  }
+  return Number(purchasePrice);
+}
+
+// Ручной pricing валиден, только если это непустой массив объектов с
+// непустым label и числовым pct. Иначе считаем "не задано" и запускаем
+// автоматику — это же лечит уже испорченные записи (см. баг посимвольного
+// спреда строки в ProductForm.jsx: updatePricingItem/normalizePricing).
+function isValidManualPricing(pricing) {
+  return Array.isArray(pricing) && pricing.length > 0 && pricing.every((p) =>
+    p && typeof p === 'object' && !Array.isArray(p)
+    && typeof p.label === 'string' && p.label.trim() !== ''
+    && typeof p.pct === 'number' && Number.isFinite(p.pct)
+  );
+}
+
+// Метод наибольших остатков (Hamilton): округляет проценты так, чтобы их
+// сумма была ровно 100, а не "около 100" из-за независимого округления
+// каждого сегмента.
+function roundPercentsTo100(rawPercents) {
+  const floors = rawPercents.map((p) => Math.floor(p));
+  const remainder = 100 - floors.reduce((a, b) => a + b, 0);
+  const order = rawPercents
+    .map((p, i) => ({ i, frac: p - Math.floor(p) }))
+    .sort((a, b) => b.frac - a.frac);
+  const result = [...floors];
+  for (let k = 0; k < remainder; k++) {
+    result[order[k].i] += 1;
+  }
+  return result;
+}
+
+function computeAutoPricing({ price, purchasePrice, pricingUnit, weightKg, productMarginPercent, subcategoryMarginPercent, settings }) {
+  const price_ = Number(price);
+  if (!Number.isFinite(price_) || price_ <= 0) return null;
+
+  const fixedCostsMonthly = Number(settings?.fixedCostsMonthly) || 0;
+  const plannedSalesMonthly = Number(settings?.plannedSalesMonthly) || 0;
+  const packagingCostPerUnit = Number(settings?.packagingCostPerUnit) || 0;
+  const acquiringPercent = Number(settings?.acquiringPercent) || 0;
+  const defaultMarginPercent = Number(settings?.defaultMarginPercent) || 0;
+  const wastePercent = Number(settings?.wastePercent) || 0;
+  const avgItemsPerOrder = settings?.avgItemsPerOrder != null ? Number(settings.avgItemsPerOrder) : null;
+
+  // Настройки ценообразования не заполнены — считать не из чего.
+  if (plannedSalesMonthly <= 0 || !avgItemsPerOrder || avgItemsPerOrder <= 0) return null;
+
+  const w = wastePercent / 100;
+  if (w >= 1) return null;
+
+  const fixedShare = (fixedCostsMonthly / plannedSalesMonthly) / avgItemsPerOrder;
+
+  // Приоритет 1: purchase_price заполнена — доля фермера напрямую.
+  // Приоритет 2: не заполнена — подразумеваемая закупка обратным ходом из
+  // той же формулы, что и рекомендуемая цена, но относительно текущей цены.
+  let farmerShareValue;
+  const directCost = effectivePurchaseCost({ purchasePrice, pricingUnit, weightKg });
+
+  if (directCost != null) {
+    farmerShareValue = directCost;
+  } else {
+    let marginPercent = defaultMarginPercent;
+    if (productMarginPercent != null) marginPercent = Number(productMarginPercent);
+    else if (subcategoryMarginPercent != null) marginPercent = Number(subcategoryMarginPercent);
+    const m = marginPercent / 100;
+
+    // Реальная комиссия эквайринга с конкретной продажи не завязана на
+    // списания — waste-adjusted aw используется только для D (там он часть
+    // модели ценообразования, а не факт по этой транзакции).
+    const a = acquiringPercent / 100;
+    const aw = a / (1 - w);
+
+    const D = (price_ * (1 - aw * (1 + m))) / (1 + m);
+    const Cw = D - fixedShare;
+    farmerShareValue = Cw * (1 - w) - packagingCostPerUnit;
+
+    if (!(farmerShareValue > 0)) return null;
+  }
+
+  const farmerPctRaw = (farmerShareValue / price_) * 100;
+  if (farmerPctRaw < FAIR_PRICE_MIN_FARMER_PCT || farmerPctRaw > FAIR_PRICE_MAX_FARMER_PCT) return null;
+
+  const packagingPctRaw = (packagingCostPerUnit / price_) * 100;
+  const servicePctRaw = acquiringPercent + (fixedShare / price_) * 100;
+  const logisticsPctRaw = 100 - farmerPctRaw - packagingPctRaw - servicePctRaw;
+
+  const rawPercents = [farmerPctRaw, logisticsPctRaw, packagingPctRaw, servicePctRaw];
+  // Любой сегмент в минус (обычно логистика на слишком дешёвых товарах с
+  // высокой долей постоянных расходов) — тоже "бессмыслица", прячем блок.
+  if (rawPercents.some((v) => v < 0)) return null;
+
+  const [farmerPct, logisticsPct, packagingPct, servicePct] = roundPercentsTo100(rawPercents);
+
+  return [
+    { label: 'Поставщику', sub: 'фермер получает напрямую', pct: farmerPct, amount: Math.round(price_ * farmerPct / 100), color: FAIR_PRICE_SEGMENT_COLORS[0] },
+    { label: 'Логистика', sub: 'доставка и хранение', pct: logisticsPct, amount: Math.round(price_ * logisticsPct / 100), color: FAIR_PRICE_SEGMENT_COLORS[1] },
+    { label: 'Упаковка и сборка', sub: 'картон, сортировка', pct: packagingPct, amount: Math.round(price_ * packagingPct / 100), color: FAIR_PRICE_SEGMENT_COLORS[2] },
+    { label: 'Сервис', sub: 'работа склада, эквайринг', pct: servicePct, amount: Math.round(price_ * servicePct / 100), color: FAIR_PRICE_SEGMENT_COLORS[3] },
+  ];
+}
 
 // Весь каталог (категории + товары + отзывы + доставки) — то, что раньше было в products.js
 app.get('/api/catalog', resolveUserOptional, async (req, res) => {
   try {
-    const [categoriesRes, subcatsRes, productsRes, reviewsRes, reviewStatsRes, deliveriesRes, compositionsRes, productRatingsRes, homeShelvesRes] = await Promise.all([
+    const [categoriesRes, subcatsRes, productsRes, reviewsRes, reviewStatsRes, deliveriesRes, compositionsRes, productRatingsRes, homeShelvesRes, pricingSettingsRes] = await Promise.all([
       query('SELECT * FROM categories ORDER BY sort_order ASC'),
       query('SELECT * FROM subcategories ORDER BY category_id, sort_order ASC'),
       // Группировка по подкатегории сохраняется, но внутри неё (и там, где
@@ -621,6 +745,9 @@ app.get('/api/catalog', resolveUserOptional, async (req, res) => {
          WHERE p.is_active = true
          ORDER BY hps.shelf, hps.sort_order ASC`
       ),
+      // Для автоматического расчёта "Честная цена" у товаров без ручного
+      // pricing (см. computeAutoPricing выше).
+      query('SELECT * FROM pricing_settings LIMIT 1'),
     ]);
 
     const votedReviewIds = await loadHelpfulVotedIds(req.userId, reviewsRes.rows.map((r) => r.id));
@@ -642,6 +769,12 @@ app.get('/api/catalog', resolveUserOptional, async (req, res) => {
       homeShelves[row.shelf].push(row.product_id);
     }
 
+    const subcategoryMarginById = {};
+    for (const sc of subcatsRes.rows) {
+      subcategoryMarginById[sc.id] = sc.target_margin_percent != null ? Number(sc.target_margin_percent) : null;
+    }
+    const pricingSettingsForCalc = pricingSettingsRes.rows[0] ? toPricingSettingsDTO(pricingSettingsRes.rows[0]) : null;
+
     res.json({
       categories: [{ id: 'all', label: 'Все' }, ...categoriesRes.rows.map((c) => ({ id: c.id, label: c.label }))],
       subcategories: subcatsRes.rows.map((sc) => ({
@@ -651,11 +784,36 @@ app.get('/api/catalog', resolveUserOptional, async (req, res) => {
         slug: sc.slug,
         sort_order: sc.sort_order,
       })),
-      products: productsRes.rows.map((row) => ({
-        ...toProductDTO(row),
-        bundleComposition: compositionsByProduct[row.id] ?? null,
-        rating: ratingByProduct[row.id] ?? null,
-      })),
+      products: productsRes.rows.map((row) => {
+        const dto = toProductDTO(row);
+        if (row.is_bundle) {
+          // Наборы никогда не считаются автоматически — сверено на данных:
+          // у всех 8 наборов проценты уникальные и осмысленные (включая
+          // Гриль-набор, у которого разбивка совпадает с типовым дефолтом
+          // 33/25/12/15/15 — это тоже подтверждённый ручной ввод, не
+          // заглушка). У наборов бывают статьи сверх стандартных 4
+          // (например "Сборка"), 4-сегментная модель им не подходит в
+          // принципе — исключение по is_bundle, а не по валидности pricing.
+          if (!isValidManualPricing(row.pricing)) dto.pricing = [];
+        } else if (!isValidManualPricing(row.pricing)) {
+          // Обычный товар без валидного ручного pricing (пусто или
+          // испорчено — см. isValidManualPricing) — считаем сами.
+          dto.pricing = computeAutoPricing({
+            price: row.price,
+            purchasePrice: row.purchase_price,
+            pricingUnit: row.pricing_unit,
+            weightKg: row.weight_kg,
+            productMarginPercent: row.individual_margin_percent,
+            subcategoryMarginPercent: row.subcategory_id != null ? subcategoryMarginById[row.subcategory_id] : null,
+            settings: pricingSettingsForCalc,
+          }) || [];
+        }
+        return {
+          ...dto,
+          bundleComposition: compositionsByProduct[row.id] ?? null,
+          rating: ratingByProduct[row.id] ?? null,
+        };
+      }),
       reviews: reviewsRes.rows.map((row) => toReviewDTO(row, votedReviewIds)),
       reviewStats: toReviewStatsDTO(reviewStatsRes.rows[0]),
       deliveries: deliveriesRes.rows.map((d) => ({
