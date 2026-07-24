@@ -2287,7 +2287,7 @@ app.put('/api/admin/subcategories/:id', requireAuth, async (req, res) => {
       ? newName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-zа-яё0-9-]/gi, '')
       : cur.slug;
     const result = await query(
-      'UPDATE subcategories SET name = $1, slug = $2, sort_order = $3, category_id = $4, target_margin_percent = $5, updated_at = now() WHERE id = $6 RETURNING *',
+      'UPDATE subcategories SET name = $1, slug = $2, sort_order = $3, category_id = $4, target_margin_percent = $5 WHERE id = $6 RETURNING *',
       [
         newName,
         newSlug,
