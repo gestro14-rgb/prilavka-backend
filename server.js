@@ -51,7 +51,7 @@ let settingsCache = {
   min_order_total:          '1990',
   points_percent:           '5',
   referral_points_reward:   '100',
-  referral_discount:        '200',
+  referral_discount:        '100',
   max_points_spend_percent: '30',
   default_slot:             '18:00–21:00',
   review_photo_points:      '50',
