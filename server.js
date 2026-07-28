@@ -577,6 +577,24 @@ app.get('/api/districts', async (req, res) => {
   }
 });
 
+// Иконки статичных мест интерфейса (заголовки секций в Профиле и т.п.) —
+// публичный маршрут, читает и приложение (для отображения), и админка (для
+// списка на странице "Иконки интерфейса"). Запись — только через
+// /api/admin/ui-icons/:key (см. ниже), здесь только чтение.
+app.get('/api/ui-icons', async (req, res) => {
+  try {
+    const result = await query('SELECT key, image_url, fallback_emoji FROM ui_icons ORDER BY key');
+    res.json(result.rows.map((row) => ({
+      key: row.key,
+      imageUrl: row.image_url,
+      fallbackEmoji: row.fallback_emoji,
+    })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
 
 // ============================================================
 // Автоматический расчёт разбивки "Честная цена" (Поставщику/Логистика/
@@ -3725,6 +3743,27 @@ app.put('/api/admin/settings/:key', requireAuth, async (req, res) => {
     }
     settingsCache[key] = String(value).trim();
     res.json(result.rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// image_url = '' или null — сброс к fallback_emoji (или к SVG-иконке на
+// фронте, если fallback_emoji тоже пуст, см. migrations/039_ui_icons.sql).
+app.put('/api/admin/ui-icons/:key', requireAuth, async (req, res) => {
+  const { key } = req.params;
+  const { imageUrl } = req.body || {};
+  try {
+    const result = await query(
+      'UPDATE ui_icons SET image_url = $1, updated_at = now() WHERE key = $2 RETURNING key, image_url, fallback_emoji',
+      [imageUrl ? String(imageUrl).trim() : null, key]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Иконка не найдена' });
+    }
+    const row = result.rows[0];
+    res.json({ key: row.key, imageUrl: row.image_url, fallbackEmoji: row.fallback_emoji });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
