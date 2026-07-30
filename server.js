@@ -85,6 +85,8 @@ function toProductDTO(row) {
     slug: row.slug || row.id,
     title: row.title,
     price: row.price,
+    // "Было" для зачёркнутой цены (см. PriceTag.jsx) — null, если скидки нет.
+    oldPrice: row.old_price != null ? Number(row.old_price) : null,
     weight: row.weight,
     emoji: row.emoji,
     bg: row.bg,
@@ -839,6 +841,9 @@ app.get('/api/catalog', resolveUserOptional, async (req, res) => {
         title: d.title,
         text: d.text,
         imageUrl: d.image_url || null,
+        // Момент реального добавления записи — дата на Главной больше не
+        // вписывается вручную в text (см. migrations/042).
+        createdAt: d.created_at,
       })),
       // Ручные подборки: { hits: [productId, ...], seasonal: [productId, ...] }.
       // Заголовок/подзаголовок "Сейчас в сезоне" — из settings (редактируется
@@ -2083,13 +2088,14 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
       : null;
     await query(
       `INSERT INTO products
-        (id, slug, title, price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg, individual_margin_percent)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
+        (id, slug, title, price, old_price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg, individual_margin_percent)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)`,
       [
         p.id,
         p.slug || p.id,
         p.title,
         p.price,
+        p.oldPrice != null && p.oldPrice !== '' ? p.oldPrice : null,
         p.weight || '',
         p.emoji || '🛒',
         p.bg || 'linear-gradient(135deg, #F4F7F2, #fff)',
@@ -2178,8 +2184,9 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         pricing_unit = $23,
         weight_kg = $24,
         individual_margin_percent = $25,
+        old_price = $26,
         updated_at = now()
-       WHERE id = $26`,
+       WHERE id = $27`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -2210,6 +2217,7 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         pricingUnit,
         weightKg,
         individualMargin,
+        p.oldPrice !== undefined ? (p.oldPrice !== '' && p.oldPrice != null ? p.oldPrice : null) : cur.old_price,
         req.params.id,
       ]
     );
@@ -2930,6 +2938,7 @@ app.get('/api/admin/deliveries', requireAuth, async (req, res) => {
       text: d.text,
       imageUrl: d.image_url || null,
       sortOrder: d.sort_order,
+      createdAt: d.created_at,
     })));
   } catch (e) {
     console.error(e);
@@ -2949,7 +2958,7 @@ app.post('/api/admin/deliveries', requireAuth, async (req, res) => {
       [emoji, title, text, imageUrl || null, Number(sortOrder) || 0]
     );
     const d = result.rows[0];
-    res.status(201).json({ id: d.id, emoji: d.emoji, title: d.title, text: d.text, imageUrl: d.image_url || null, sortOrder: d.sort_order });
+    res.status(201).json({ id: d.id, emoji: d.emoji, title: d.title, text: d.text, imageUrl: d.image_url || null, sortOrder: d.sort_order, createdAt: d.created_at });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
@@ -2976,7 +2985,7 @@ app.put('/api/admin/deliveries/:id', requireAuth, async (req, res) => {
       ]
     );
     const d = result.rows[0];
-    res.json({ id: d.id, emoji: d.emoji, title: d.title, text: d.text, imageUrl: d.image_url || null, sortOrder: d.sort_order });
+    res.json({ id: d.id, emoji: d.emoji, title: d.title, text: d.text, imageUrl: d.image_url || null, sortOrder: d.sort_order, createdAt: d.created_at });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
