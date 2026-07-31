@@ -425,6 +425,13 @@ function generateReferralCode() {
 
 // Создаёт запись пользователя или обновляет имя при повторном обращении.
 // Генерирует уникальный реферальный код при первом создании.
+//
+// (xmax = 0) отличает вставку от обновления: у только что вставленной строки
+// xmax нулевой, у обновлённой через DO UPDATE — это id блокирующей
+// транзакции. Без этого признака ON CONFLICT ... RETURNING не даёт способа
+// понять, новый ли это пользователь — а уведомление админу нужно ровно один
+// раз, а не при каждом заходе. Наружу флаг не отдаём: вызывающий код ждёт
+// строку пользователя ровно в том виде, в каком она лежит в таблице.
 async function upsertUser(telegramId, username, firstName) {
   for (let attempt = 0; attempt < 5; attempt++) {
     const code = generateReferralCode();
@@ -436,10 +443,12 @@ async function upsertUser(telegramId, username, firstName) {
            username = EXCLUDED.username,
            first_name = EXCLUDED.first_name,
            updated_at = now()
-         RETURNING *`,
+         RETURNING *, (xmax = 0) AS is_new`,
         [telegramId, username || null, firstName || null, code]
       );
-      return result.rows[0];
+      const { is_new: isNew, ...user } = result.rows[0];
+      if (isNew) notifyNewUser(user, 'Telegram');
+      return user;
     } catch (e) {
       if (e.code === '23505' && e.detail?.includes('referral_code')) continue;
       throw e;
@@ -469,6 +478,29 @@ async function sendTelegramMessageToChat(chatId, text) {
 // Отправляет уведомление администратору (в TELEGRAM_ADMIN_CHAT_ID).
 function sendTelegramMessage(text) {
   return sendTelegramMessageToChat(TELEGRAM_ADMIN_CHAT_ID, text);
+}
+
+// Все сообщения уходят с parse_mode: 'HTML', поэтому имя из Telegram
+// (произвольный текст пользователя) обязано быть экранировано — иначе имя
+// с '<' ломает разметку и Telegram отклоняет сообщение целиком.
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+// Уведомление админу о первом появлении пользователя в БД. Вызывается из
+// upsertUser/upsertUserByPhone только когда строка реально была вставлена.
+// Намеренно не await — регистрация не должна ждать Telegram и тем более
+// падать из-за него (ошибки логирует sendTelegramMessageToChat).
+function notifyNewUser(user, source) {
+  const name = [user.first_name, user.username && `@${user.username}`]
+    .filter(Boolean)
+    .map(escapeHtml)
+    .join(' ');
+  const who = name || (user.phone ? escapeHtml(user.phone) : `id ${user.id}`);
+  sendTelegramMessage(`👤 Новый пользователь: <b>${who}</b>\nВход: ${escapeHtml(source)}`);
 }
 
 const fmtOrderId = (id) => '#' + String(id).padStart(4, '0');
@@ -1648,10 +1680,12 @@ async function upsertUserByPhone(phone) {
          VALUES ($1, $2)
          ON CONFLICT (phone) WHERE phone IS NOT NULL DO UPDATE SET
            updated_at = now()
-         RETURNING *`,
+         RETURNING *, (xmax = 0) AS is_new`,
         [phone, code]
       );
-      return result.rows[0];
+      const { is_new: isNew, ...user } = result.rows[0];
+      if (isNew) notifyNewUser(user, 'телефон + SMS');
+      return user;
     } catch (e) {
       if (e.code === '23505' && e.detail?.includes('referral_code')) continue;
       throw e;
@@ -3378,6 +3412,21 @@ app.get('/api/admin/analytics/funnel', requireAuth, async (req, res) => {
   }
 });
 
+// Имя пользователя для аналитики. ВАЖНО: analytics_events.user_id — это
+// telegram_id (фронт шлёт Telegram.WebApp.initDataUnsafe.user.id), а НЕ
+// суррогатный users.id, на который ссылается orders.user_id. Поэтому JOIN
+// в запросах ниже идёт по users.telegram_id — иначе к сессиям подтянулись бы
+// имена посторонних людей с совпавшим id.
+//
+// Возвращает null, когда сопоставить не с кем: у входа по телефону (без
+// Telegram) и у сессий вне Telegram user_id вообще не пишется.
+function analyticsUserName(row) {
+  if (row.first_name || row.username) {
+    return [row.first_name, row.username && `@${row.username}`].filter(Boolean).join(' ');
+  }
+  return row.phone || null;
+}
+
 // Список сессий за период (опционально — по user_id): дата начала,
 // число событий, до какого шага воронки дошла.
 app.get('/api/admin/analytics/sessions', requireAuth, async (req, res) => {
@@ -3390,26 +3439,31 @@ app.get('/api/admin/analytics/sessions', requireAuth, async (req, res) => {
       userFilter = `AND user_id = $${params.length}`;
     }
     const result = await query(
-      `SELECT
-         session_id,
-         MAX(user_id) AS user_id,
-         MIN(created_at) AS started_at,
-         COUNT(*)::int AS event_count,
-         MAX(
-           CASE
-             WHEN event_type = 'order_placed' THEN 6
-             WHEN event_type = 'checkout_start' THEN 5
-             WHEN event_type = 'screen_view' AND screen_name = 'cart' THEN 4
-             WHEN event_type = 'screen_view' AND screen_name = 'product' THEN 3
-             WHEN event_type = 'screen_view' AND screen_name = 'catalog' THEN 2
-             WHEN event_type = 'screen_view' AND screen_name = 'home' THEN 1
-             ELSE 0
-           END
-         ) AS final_step_rank
-       FROM analytics_events
-       WHERE created_at >= $1 AND created_at < $2 ${userFilter}
-       GROUP BY session_id
-       ORDER BY started_at DESC
+      `WITH sess AS (
+         SELECT
+           session_id,
+           MAX(user_id) AS user_id,
+           MIN(created_at) AS started_at,
+           COUNT(*)::int AS event_count,
+           MAX(
+             CASE
+               WHEN event_type = 'order_placed' THEN 6
+               WHEN event_type = 'checkout_start' THEN 5
+               WHEN event_type = 'screen_view' AND screen_name = 'cart' THEN 4
+               WHEN event_type = 'screen_view' AND screen_name = 'product' THEN 3
+               WHEN event_type = 'screen_view' AND screen_name = 'catalog' THEN 2
+               WHEN event_type = 'screen_view' AND screen_name = 'home' THEN 1
+               ELSE 0
+             END
+           ) AS final_step_rank
+         FROM analytics_events
+         WHERE created_at >= $1 AND created_at < $2 ${userFilter}
+         GROUP BY session_id
+       )
+       SELECT sess.*, u.first_name, u.username, u.phone
+       FROM sess
+       LEFT JOIN users u ON u.telegram_id = sess.user_id
+       ORDER BY sess.started_at DESC
        LIMIT 200`,
       params
     );
@@ -3417,6 +3471,7 @@ app.get('/api/admin/analytics/sessions', requireAuth, async (req, res) => {
     res.json(result.rows.map((r) => ({
       sessionId: r.session_id,
       userId: r.user_id,
+      userName: analyticsUserName(r),
       startedAt: r.started_at,
       eventCount: r.event_count,
       finalStep: STEP_BY_RANK[r.final_step_rank] || 'other',
@@ -3431,16 +3486,21 @@ app.get('/api/admin/analytics/sessions', requireAuth, async (req, res) => {
 app.get('/api/admin/analytics/sessions/:session_id', requireAuth, async (req, res) => {
   try {
     const result = await query(
-      `SELECT user_id, event_type, screen_name, metadata, created_at
-       FROM analytics_events WHERE session_id = $1 ORDER BY created_at ASC`,
+      `SELECT e.user_id, e.event_type, e.screen_name, e.metadata, e.created_at,
+              u.first_name, u.username, u.phone
+       FROM analytics_events e
+       LEFT JOIN users u ON u.telegram_id = e.user_id
+       WHERE e.session_id = $1 ORDER BY e.created_at ASC`,
       [req.params.session_id]
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Сессия не найдена' });
     }
+    const identified = result.rows.find((r) => r.user_id != null);
     res.json({
       sessionId: req.params.session_id,
-      userId: result.rows.find((r) => r.user_id != null)?.user_id ?? null,
+      userId: identified?.user_id ?? null,
+      userName: identified ? analyticsUserName(identified) : null,
       events: result.rows.map((r) => ({
         eventType: r.event_type,
         screenName: r.screen_name,
