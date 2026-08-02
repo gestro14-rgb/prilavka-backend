@@ -87,6 +87,12 @@ function toProductDTO(row) {
     price: row.price,
     // "Было" для зачёркнутой цены (см. PriceTag.jsx) — null, если скидки нет.
     oldPrice: row.old_price != null ? Number(row.old_price) : null,
+    // Продажная цена за килограмм для витринного акцента "39 ₽/кг"
+    // (migrations/045) — customer-facing, поэтому в публичном DTO, в
+    // отличие от pricingUnit/weightKg ниже (те только для закупки, см.
+    // toAdminProductDTO). null — товар без акцента, PriceTag.jsx рендерит
+    // обычную price как раньше.
+    pricePerKg: row.price_per_kg != null ? Number(row.price_per_kg) : null,
     weight: row.weight,
     emoji: row.emoji,
     bg: row.bg,
@@ -2221,12 +2227,16 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
     return res.status(400).json({ error: "pricingUnit должен быть 'kg' или 'piece'" });
   }
   try {
-    // weight_kg имеет смысл только при закупке за кг (migrations/036) — при
-    // 'piece' пишем NULL, чтобы в базе не оставался вес, который ни на что
-    // не влияет.
+    // weight_kg и price_per_kg имеют смысл только при закупке за кг
+    // (migrations/036, 045) — при 'piece' пишем NULL в оба, чтобы в базе не
+    // оставались значения, которые ни на что не влияют (price_per_kg без
+    // веса нечем умножить, витринный акцент показывать не по чему).
     const pricingUnit = p.pricingUnit === 'kg' ? 'kg' : 'piece';
     const weightKg = pricingUnit === 'kg' && p.weightKg != null && p.weightKg !== '' && Number(p.weightKg) > 0
       ? Number(p.weightKg)
+      : null;
+    const pricePerKg = pricingUnit === 'kg' && p.pricePerKg != null && p.pricePerKg !== '' && Number(p.pricePerKg) > 0
+      ? Number(p.pricePerKg)
       : null;
     // Индивидуальная маржа (migrations/038) — верхний уровень приоритета;
     // 0 — валидное значение, "не задано" — только null/пусто.
@@ -2235,8 +2245,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
       : null;
     await query(
       `INSERT INTO products
-        (id, slug, title, price, old_price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg, individual_margin_percent)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)`,
+        (id, slug, title, price, old_price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg, individual_margin_percent, price_per_kg)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)`,
       [
         p.id,
         p.slug || p.id,
@@ -2265,6 +2275,7 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
         pricingUnit,
         weightKg,
         individualMargin,
+        pricePerKg,
       ]
     );
     const result = await query('SELECT * FROM products WHERE id = $1', [p.id]);
@@ -2290,12 +2301,17 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
     if (!existing.rows[0]) return res.status(404).json({ error: 'Товар не найден' });
     const cur = existing.rows[0];
 
-    // Итоговая единица закупки — из запроса или текущая; вес хранится только
-    // при 'kg' (см. migrations/036), при 'piece' затирается в NULL.
+    // Итоговая единица закупки — из запроса или текущая; вес и цена за кг
+    // (migrations/036, 045) хранятся только при 'kg', при 'piece' затираются
+    // в NULL.
     const pricingUnit = p.pricingUnit !== undefined ? p.pricingUnit : (cur.pricing_unit || 'piece');
     const weightKgRaw = p.weightKg !== undefined ? p.weightKg : cur.weight_kg;
     const weightKg = pricingUnit === 'kg' && weightKgRaw != null && weightKgRaw !== '' && Number(weightKgRaw) > 0
       ? Number(weightKgRaw)
+      : null;
+    const pricePerKgRaw = p.pricePerKg !== undefined ? p.pricePerKg : cur.price_per_kg;
+    const pricePerKg = pricingUnit === 'kg' && pricePerKgRaw != null && pricePerKgRaw !== '' && Number(pricePerKgRaw) > 0
+      ? Number(pricePerKgRaw)
       : null;
     // Индивидуальная маржа (migrations/038): undefined — не трогаем,
     // ''/null — сброс на приоритет подкатегория → глобальная.
@@ -2332,8 +2348,9 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         weight_kg = $24,
         individual_margin_percent = $25,
         old_price = $26,
+        price_per_kg = $27,
         updated_at = now()
-       WHERE id = $27`,
+       WHERE id = $28`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -2365,6 +2382,7 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         weightKg,
         individualMargin,
         p.oldPrice !== undefined ? (p.oldPrice !== '' && p.oldPrice != null ? p.oldPrice : null) : cur.old_price,
+        pricePerKg,
         req.params.id,
       ]
     );
