@@ -1094,9 +1094,84 @@ function computeDiscount(promo, total) {
   return Math.min(promo.discount_value, total);
 }
 
+// Сколько заказов пользователь уже оформил — по user_id, а не по
+// telegram_user_id: колонка появилась в миграции 028, забэкфилена для старых
+// заказов и одинаково работает для входа через Telegram и по телефону
+// (у телефонного telegram_id нет вовсе). Отменённые не считаем: отмена не
+// должна навсегда лишать человека промокода "на первый заказ".
+async function countUserOrders(userId) {
+  const res = await query(
+    "SELECT COUNT(*)::int AS count FROM orders WHERE user_id = $1 AND status != 'cancelled'",
+    [userId]
+  );
+  return res.rows[0]?.count || 0;
+}
+
+// Русское склонение по числу: plural(3, 'заказ', 'заказа', 'заказов') → 'заказа'.
+// Тот же алгоритм, что в prilavka-app/src/format.js — сообщения об отказе
+// собираются на сервере, поэтому склонять нужно и здесь.
+function plural(n, one, few, many) {
+  const mod10 = Math.abs(n) % 10;
+  const mod100 = Math.abs(n) % 100;
+  if (mod10 === 1 && mod100 !== 11) return one;
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return few;
+  return many;
+}
+
+// Единственный источник истины по "можно ли применить этот промокод".
+// Зовётся и из /api/promo/check (предпросмотр в корзине), и из POST /api/orders
+// (списание) — раньше набор проверок был выписан в обоих местах отдельно, и
+// они разъезжались: корзина показывала отказ, а заказ молча уходил без скидки.
+// ordersCount — сколько заказов у пользователя УЖЕ есть; оформляемый сейчас
+// идёт следующим по счёту, поэтому ниже сравниваем с ordersCount + 1.
+function validatePromo(promo, { total, ordersCount }) {
+  if (!promo) {
+    return { valid: false, message: 'Промокод не найден' };
+  }
+  if (promo.is_used) {
+    return { valid: false, message: 'Промокод уже использован' };
+  }
+  if (promo.expires_at && new Date(promo.expires_at) < new Date()) {
+    return { valid: false, message: 'Промокод истёк' };
+  }
+  if (promo.min_order_total && total != null && total < promo.min_order_total) {
+    return {
+      valid: false,
+      message: `Промокод действует от ${promo.min_order_total.toLocaleString('ru-RU')} ₽`,
+    };
+  }
+
+  const orderNumber = ordersCount + 1;
+  const min = promo.min_order_number;
+  const max = promo.max_order_number;
+  if (min != null && orderNumber < min) {
+    return {
+      valid: false,
+      message: min === 2
+        ? 'Промокод действует только на повторные заказы'
+        : `Промокод действует начиная с ${min}-го заказа`,
+    };
+  }
+  if (max != null && orderNumber > max) {
+    return {
+      valid: false,
+      message: max === 1
+        ? 'Промокод действует только на первый заказ'
+        : `Промокод действует только на первые ${max} ${plural(max, 'заказ', 'заказа', 'заказов')}`,
+    };
+  }
+
+  return { valid: true, discount: computeDiscount(promo, total || 0) };
+}
+
 // Проверяет промокод и возвращает размер скидки, не списывая его.
 // Используется в корзине для предпросмотра скидки до оформления заказа.
-app.post('/api/promo/check', async (req, res) => {
+// resolveUser обязателен: без личности не посчитать номер заказа, а без него
+// условие "только на первый заказ" пришлось бы проверять лишь на сабмите —
+// то есть корзина снова показывала бы сумму, отличную от итоговой. Ограничения
+// это не добавляет: POST /api/orders и так требует авторизации, без входа
+// заказ оформить нельзя.
+app.post('/api/promo/check', resolveUser, async (req, res) => {
   const { code, total } = req.body || {};
   if (!code || !String(code).trim()) {
     return res.status(400).json({ error: 'Укажите промокод' });
@@ -1104,27 +1179,16 @@ app.post('/api/promo/check', async (req, res) => {
   try {
     const result = await query('SELECT * FROM promo_codes WHERE code = $1', [String(code).trim().toUpperCase()]);
     const promo = result.rows[0];
-    if (!promo) {
-      return res.json({ valid: false, message: 'Промокод не найден' });
+    const ordersCount = await countUserOrders(req.userId);
+    const check = validatePromo(promo, { total, ordersCount });
+    if (!check.valid) {
+      return res.json({ valid: false, message: check.message });
     }
-    if (promo.is_used) {
-      return res.json({ valid: false, message: 'Промокод уже использован' });
-    }
-    if (promo.expires_at && new Date(promo.expires_at) < new Date()) {
-      return res.json({ valid: false, message: 'Промокод истёк' });
-    }
-    if (promo.min_order_total && total != null && total < promo.min_order_total) {
-      return res.json({
-        valid: false,
-        message: `Промокод действует от ${promo.min_order_total.toLocaleString('ru-RU')} ₽`,
-      });
-    }
-    const discount = computeDiscount(promo, total || 0);
     res.json({
       valid: true,
       discountType: promo.discount_type,
       discountValue: promo.discount_value,
-      discount,
+      discount: check.discount,
     });
   } catch (e) {
     console.error(e);
@@ -1178,17 +1242,23 @@ app.post('/api/orders', resolveUser, async (req, res) => {
     let finalTotal = total;
     let appliedReferralCode = null;
 
-    // Применяем промокод (одноразовый, из таблицы promo_codes)
+    // Применяем промокод (одноразовый, из таблицы promo_codes).
+    // Проверка — та же validatePromo, что и в предпросмотре корзины, поэтому
+    // условия не могут разъехаться между экраном и сабмитом. Отказ теперь
+    // возвращается ошибкой, а не проглатывается: раньше невалидный код просто
+    // не применялся, и заказ уходил на полную сумму — пользователь видел в
+    // корзине одну цифру, а получал другую, без единого сообщения.
     if (promoCode && String(promoCode).trim()) {
       const promoRes = await query('SELECT * FROM promo_codes WHERE code = $1', [String(promoCode).trim().toUpperCase()]);
       const promo = promoRes.rows[0];
-      if (promo && !promo.is_used && (!promo.expires_at || new Date(promo.expires_at) >= new Date())) {
-        if (!promo.min_order_total || total >= promo.min_order_total) {
-          discountAmount = computeDiscount(promo, total);
-          finalTotal = Math.max(0, total - discountAmount);
-          appliedPromo = promo;
-        }
+      const ordersCount = await countUserOrders(req.userId);
+      const check = validatePromo(promo, { total, ordersCount });
+      if (!check.valid) {
+        return res.status(400).json({ error: check.message });
       }
+      discountAmount = check.discount;
+      finalTotal = Math.max(0, total - discountAmount);
+      appliedPromo = promo;
     }
 
     // Применяем реферальный код (только если нет промокода и это первый заказ)
@@ -2868,8 +2938,26 @@ function toPromoDTO(row) {
     isUsed: row.is_used,
     usedAt: row.used_at,
     expiresAt: row.expires_at,
+    minOrderNumber: row.min_order_number,
+    maxOrderNumber: row.max_order_number,
     createdAt: row.created_at,
   };
+}
+
+// Селект в админке оперирует понятными вариантами, а в базе лежит пара границ
+// (см. миграцию 044). Раскладываем вариант на min/max здесь, чтобы фронт не
+// знал про внутреннее представление и не мог записать несогласованную пару.
+function orderConditionToRange(condition, n) {
+  const count = Number.parseInt(n, 10);
+  switch (condition) {
+    case 'first_order': return { min: null, max: 1 };
+    case 'repeat_order': return { min: 2, max: null };
+    case 'first_n_orders':
+      // Некорректное или отсутствующее N трактуем как отсутствие ограничения,
+      // а не как "первые 0 заказов" — такой код не сработал бы никогда.
+      return Number.isInteger(count) && count >= 1 ? { min: null, max: count } : { min: null, max: null };
+    default: return { min: null, max: null };
+  }
 }
 
 // Список всех промокодов (новые сверху)
@@ -2885,21 +2973,27 @@ app.get('/api/admin/promo-codes', requireAuth, async (req, res) => {
 
 // Создать промокод
 app.post('/api/admin/promo-codes', requireAuth, async (req, res) => {
-  const { code, discountType, discountValue, minOrderTotal, expiresAt } = req.body || {};
+  const { code, discountType, discountValue, minOrderTotal, expiresAt, orderCondition, orderConditionN } = req.body || {};
   if (!code || !String(code).trim() || !discountValue) {
     return res.status(400).json({ error: 'Укажите код и размер скидки' });
   }
+  if (orderCondition === 'first_n_orders' && !(Number.parseInt(orderConditionN, 10) >= 1)) {
+    return res.status(400).json({ error: 'Укажите, на сколько первых заказов действует промокод' });
+  }
   const type = discountType === 'percent' ? 'percent' : 'fixed';
+  const range = orderConditionToRange(orderCondition, orderConditionN);
   try {
     const result = await query(
-      `INSERT INTO promo_codes (code, discount_type, discount_value, min_order_total, expires_at)
-       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      `INSERT INTO promo_codes (code, discount_type, discount_value, min_order_total, expires_at, min_order_number, max_order_number)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
       [
         String(code).trim().toUpperCase(),
         type,
         discountValue,
         minOrderTotal || 0,
         expiresAt || null,
+        range.min,
+        range.max,
       ]
     );
     res.status(201).json(toPromoDTO(result.rows[0]));

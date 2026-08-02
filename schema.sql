@@ -100,6 +100,17 @@ CREATE TABLE IF NOT EXISTS promo_codes (
   used_at TIMESTAMPTZ,
   used_by_telegram_id BIGINT,
   expires_at TIMESTAMPTZ,
+  -- Границы номера заказа, на который действует код (см. миграцию 044).
+  -- NULL = граница не задана: NULL/NULL — любой заказ, NULL/1 — только
+  -- первый, 2/NULL — только повторный, NULL/N — первые N заказов.
+  min_order_number INTEGER,
+  max_order_number INTEGER,
+  CONSTRAINT promo_codes_order_number_range_check CHECK (
+    (min_order_number IS NULL OR min_order_number >= 1)
+    AND (max_order_number IS NULL OR max_order_number >= 1)
+    AND (min_order_number IS NULL OR max_order_number IS NULL
+         OR min_order_number <= max_order_number)
+  ),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
