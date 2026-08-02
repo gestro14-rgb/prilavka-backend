@@ -339,17 +339,28 @@ async function resolveUserOptional(req, res, next) {
   next();
 }
 
-// Геокодирование адреса через Яндекс Geocoder HTTP API.
-// Возвращает { lat, lng, formatted } или null, если адрес не найден.
-async function geocodeAddress(address) {
+// Один запрос к Яндекс Geocoder HTTP API. Параметр geocode понимает и текст
+// ("Профсоюзная 142"), и координаты в порядке "долгота,широта" — от него же
+// зависит направление: прямое или обратное геокодирование.
+// Возвращает { lat, lng, formatted } или null, если ничего не найдено.
+// formatted — GeocoderMetaData.text, полная строка вида
+// "Россия, Москва, Профсоюзная улица, 142": на фронте её причёсывает
+// cleanStreet() (срезает "Россия"/"Москва"), а extractDistrictFromStreet()
+// вытаскивает из неё район — поэтому берём именно text, а не короткий
+// GeoObject.name, одинаково на обоих направлениях.
+async function requestGeocoder(geocode, extraParams = {}) {
   if (!YANDEX_GEOCODER_API_KEY) {
     throw new Error('YANDEX_GEOCODER_API_KEY не настроен на сервере');
   }
   const url = new URL('https://geocode-maps.yandex.ru/1.x/');
   url.searchParams.set('apikey', YANDEX_GEOCODER_API_KEY);
-  url.searchParams.set('geocode', address);
+  url.searchParams.set('geocode', geocode);
   url.searchParams.set('format', 'json');
   url.searchParams.set('results', '1');
+  url.searchParams.set('lang', 'ru_RU');
+  for (const [key, value] of Object.entries(extraParams)) {
+    url.searchParams.set(key, value);
+  }
 
   const res = await fetch(url);
   if (!res.ok) {
@@ -364,8 +375,26 @@ async function geocodeAddress(address) {
   return {
     lat: parseFloat(latStr),
     lng: parseFloat(lngStr),
-    formatted: geoObject.metaDataProperty?.GeocoderMetaData?.text || address,
+    formatted: geoObject.metaDataProperty?.GeocoderMetaData?.text || null,
   };
+}
+
+// Прямое геокодирование: текстовый адрес → координаты.
+async function geocodeAddress(address) {
+  const result = await requestGeocoder(address);
+  if (!result) return null;
+  return { ...result, formatted: result.formatted || address };
+}
+
+// Обратное геокодирование: координаты геолокации → человекочитаемый адрес.
+// Яндекс ждёт "долгота,широта" (обратный привычному порядок).
+// kind=house просим отдельным первым заходом: без него ближайшим объектом
+// часто оказывается улица/район/метро, и в поле "Улица и дом" прилетала бы
+// строка без номера дома. Если дома рядом нет (частный сектор, парк, трасса) —
+// повторяем без ограничения, чтобы вернуть хотя бы улицу, а не пустоту.
+async function reverseGeocode(lat, lng) {
+  const point = `${lng},${lat}`;
+  return (await requestGeocoder(point, { kind: 'house' })) || (await requestGeocoder(point));
 }
 
 // Автоподсказки при вводе адреса — Yandex Suggest API (v1/suggest), не
@@ -989,6 +1018,18 @@ app.post('/api/check-zone', async (req, res) => {
 
     if (typeof lat === 'number' && typeof lng === 'number') {
       point = { lat, lng };
+      // Координаты пришли с геолокации — сами по себе они пользователю ничего
+      // не говорят, поэтому переводим их обратно в адрес: именно эта строка
+      // подставится в поле "Улица и дом". Падение геокодера здесь не должно
+      // ломать проверку зоны — она считается по координатам и без адреса,
+      // поэтому ошибку глотаем и оставляем formattedAddress пустым (фронт
+      // покажет свою заглушку).
+      try {
+        const geocoded = await reverseGeocode(lat, lng);
+        if (geocoded) formattedAddress = geocoded.formatted;
+      } catch (e) {
+        console.error('Обратное геокодирование не удалось:', e.message);
+      }
     } else if (address && address.trim()) {
       const geocoded = await geocodeAddress(address.trim());
       if (!geocoded) {
@@ -1012,7 +1053,9 @@ app.post('/api/check-zone', async (req, res) => {
     res.json({
       inZone: Boolean(matchedZone),
       found: true,
-      address: formattedAddress,
+      // Всегда явным ключом (null, а не пропущенное поле) — фронту нужно
+      // отличать "адрес не определился" от "поля нет в ответе старого сервера".
+      address: formattedAddress || null,
       zone: matchedZone ? matchedZone.label : null,
       point,
     });
