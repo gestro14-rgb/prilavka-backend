@@ -55,6 +55,7 @@ let settingsCache = {
   max_points_spend_percent: '30',
   default_slot:             '18:00–21:00',
   review_photo_points:      '50',
+  today_cutoff_time:        '17:00',
 };
 
 async function loadSettings() {
@@ -3738,6 +3739,18 @@ app.get('/api/delivery-schedule', async (req, res) => {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
   }
+});
+
+// Публичный: время отсечки для предупреждения "успеем доставить только
+// завтра" при выборе даты "Сегодня" (Cart.jsx, migrations/046). Отдельный
+// эндпоинт, а не поле внутри /api/delivery-schedule — тот отдаёт голый
+// массив (schedule.map/every/findIndex во фронте завязаны на эту форму),
+// и превращение его в { days, todayCutoffTime } было бы breaking change
+// публичного API: при рассинхроне деплоя бэкенда и клиента с ещё не
+// обновившимся бандлом (см. useVersionCheck.js) чекаут упал бы на
+// "schedule.map is not a function" у всех со старым бандлом в памяти.
+app.get('/api/delivery-cutoff', (req, res) => {
+  res.json({ todayCutoffTime: getSetting('today_cutoff_time') });
 });
 
 // Админ: те же 7 дней (с id для редактирования)
