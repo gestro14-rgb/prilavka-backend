@@ -5,6 +5,9 @@ import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import 'dotenv/config';
 import { pool, query } from './db.js';
+import { s3Client, S3_BUCKET } from './s3.js';
+import { PutObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { v2 as cloudinary } from 'cloudinary';
 import multer from 'multer';
 
@@ -147,6 +150,24 @@ function toSubcategoryDTO(row) {
     // Второй уровень приоритета маржи (migrations/038); null — у
     // подкатегории нет своей маржи, действует глобальная настройка.
     targetMarginPercent: row.target_margin_percent != null ? Number(row.target_margin_percent) : null,
+  };
+}
+
+// Сторис-карточка Главной (migrations/047). productId наружу отдаём, хотя
+// фронт его пока не читает — понадобится странице просмотра видео.
+function toStoryCardDTO(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    priceLabel: row.price_label || '',
+    coverImageUrl: row.cover_image_url || null,
+    videoUrl: row.video_url || null,
+    durationSeconds: row.duration_seconds ?? 0,
+    badgeText: row.badge_text || null,
+    productId: row.product_id || null,
+    sortOrder: row.sort_order,
+    isActive: row.is_active,
+    createdAt: row.created_at,
   };
 }
 
@@ -795,7 +816,7 @@ function computeAutoPricing({ price, purchasePrice, pricingUnit, weightKg, produ
 // Весь каталог (категории + товары + отзывы + доставки) — то, что раньше было в products.js
 app.get('/api/catalog', resolveUserOptional, async (req, res) => {
   try {
-    const [categoriesRes, subcatsRes, productsRes, reviewsRes, reviewStatsRes, deliveriesRes, compositionsRes, productRatingsRes, homeShelvesRes, pricingSettingsRes] = await Promise.all([
+    const [categoriesRes, subcatsRes, productsRes, reviewsRes, reviewStatsRes, deliveriesRes, compositionsRes, productRatingsRes, homeShelvesRes, pricingSettingsRes, storyCardsRes] = await Promise.all([
       query('SELECT * FROM categories ORDER BY sort_order ASC'),
       query('SELECT * FROM subcategories ORDER BY category_id, sort_order ASC'),
       // Группировка по подкатегории сохраняется, но внутри неё (и там, где
@@ -836,6 +857,11 @@ app.get('/api/catalog', resolveUserOptional, async (req, res) => {
       // Для автоматического расчёта "Честная цена" у товаров без ручного
       // pricing (см. computeAutoPricing выше).
       query('SELECT * FROM pricing_settings LIMIT 1'),
+      // Сторис-лента Главной (migrations/047) — только активные, порядок
+      // ручной. Едет вместе с остальными данными Главной (deliveries,
+      // homeShelves, homeContent), а не отдельной ручкой: Home и так тянет
+      // /api/catalog через CatalogContext, второй сетевой запрос не нужен.
+      query('SELECT * FROM story_cards WHERE is_active = true ORDER BY sort_order ASC, id ASC'),
     ]);
 
     const votedReviewIds = await loadHelpfulVotedIds(req.userId, reviewsRes.rows.map((r) => r.id));
@@ -921,6 +947,7 @@ app.get('/api/catalog', resolveUserOptional, async (req, res) => {
         seasonalTitle: getSetting('home_seasonal_title') || 'Сейчас в сезоне',
         seasonalSubtitle: getSetting('home_seasonal_subtitle') || '',
       },
+      storyCards: storyCardsRes.rows.map(toStoryCardDTO),
     });
   } catch (e) {
     console.error(e);
@@ -3427,6 +3454,151 @@ app.delete('/api/admin/rewards/:id', requireAuth, async (req, res) => {
   try {
     const result = await query('DELETE FROM rewards WHERE id = $1 RETURNING id', [req.params.id]);
     if (!result.rows[0]) return res.status(404).json({ error: 'Награда не найдена' });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ============================================================
+// Админские маршруты — сторис-карточки Главной (migrations/047)
+// ============================================================
+
+// Presigned PUT в S3 (Selectel) — админка грузит файл НАПРЯМУЮ в бакет по
+// этой временной ссылке, минуя бэкенд. Видео тяжёлое, гонять его через
+// прокси-ручку (как /api/admin/upload-image для картинок в Cloudinary)
+// незачем: сервер бы держал весь файл в памяти multer'ом ради того же
+// результата. Бэкенд только подписывает ссылку и говорит, по какому
+// публичному URL файл будет доступен после заливки — сам URL сохраняется в
+// story_cards отдельным PUT-запросом уже после успешной загрузки.
+//
+// Бакет публичный на чтение, поэтому presigned нужен только на запись
+// (GET-ссылки постоянные, без срока жизни — их и храним в БД).
+//
+// ВАЖНО: браузеру нужен CORS-доступ к бакету на PUT с origin админки —
+// это настраивается в панели Selectel, кодом не лечится.
+const STORY_UPLOAD_URL_TTL_SEC = 15 * 60;
+const STORY_ALLOWED_KINDS = { video: 'stories/video', cover: 'stories/cover' };
+
+app.post('/api/admin/story-cards/upload-url', requireAuth, async (req, res) => {
+  const { kind, contentType, fileName } = req.body || {};
+  const prefix = STORY_ALLOWED_KINDS[kind];
+  if (!prefix) {
+    return res.status(400).json({ error: "kind должен быть 'video' или 'cover'" });
+  }
+  if (!contentType || typeof contentType !== 'string') {
+    return res.status(400).json({ error: 'Укажите contentType файла' });
+  }
+  const expectedPrefix = kind === 'video' ? 'video/' : 'image/';
+  if (!contentType.startsWith(expectedPrefix)) {
+    return res.status(400).json({ error: `Для kind=${kind} ожидается contentType ${expectedPrefix}*` });
+  }
+  if (!S3_BUCKET) {
+    return res.status(500).json({ error: 'S3 не настроен: не задан S3_BUCKET' });
+  }
+  try {
+    // Расширение берём из имени файла, а не из contentType — mime-типы
+    // видео (video/quicktime) не мапятся на расширение однозначно.
+    const ext = String(fileName || '').includes('.')
+      ? String(fileName).split('.').pop().toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 5)
+      : '';
+    const key = `${prefix}/${crypto.randomUUID()}${ext ? `.${ext}` : ''}`;
+    const uploadUrl = await getSignedUrl(
+      s3Client,
+      new PutObjectCommand({ Bucket: S3_BUCKET, Key: key, ContentType: contentType }),
+      { expiresIn: STORY_UPLOAD_URL_TTL_SEC }
+    );
+    // Path-style, как и клиент (forcePathStyle в s3.js) — иначе публичная
+    // ссылка не совпала бы с адресом, по которому реально лежит объект.
+    const publicUrl = `${process.env.S3_ENDPOINT.replace(/\/+$/, '')}/${S3_BUCKET}/${key}`;
+    res.json({ uploadUrl, publicUrl, key, expiresIn: STORY_UPLOAD_URL_TTL_SEC });
+  } catch (e) {
+    console.error('S3 presign error:', e);
+    res.status(500).json({ error: 'Не удалось подготовить ссылку для загрузки' });
+  }
+});
+
+app.get('/api/admin/story-cards', requireAuth, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM story_cards ORDER BY sort_order ASC, id ASC');
+    res.json(result.rows.map(toStoryCardDTO));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.post('/api/admin/story-cards', requireAuth, async (req, res) => {
+  const { title, priceLabel, coverImageUrl, videoUrl, durationSeconds, badgeText, productId, sortOrder, isActive } = req.body || {};
+  if (!title || !String(title).trim()) {
+    return res.status(400).json({ error: 'Укажите title' });
+  }
+  try {
+    const result = await query(
+      `INSERT INTO story_cards
+         (title, price_label, cover_image_url, video_url, duration_seconds, badge_text, product_id, sort_order, is_active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+      [
+        String(title).trim(),
+        priceLabel != null ? String(priceLabel).trim() : '',
+        coverImageUrl || null,
+        videoUrl || null,
+        Number(durationSeconds) || 0,
+        badgeText ? String(badgeText).trim() : null,
+        productId || null,
+        Number(sortOrder) || 0,
+        isActive !== undefined ? Boolean(isActive) : true,
+      ]
+    );
+    res.status(201).json(toStoryCardDTO(result.rows[0]));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Частичное обновление: undefined-поля не трогаем (как в PUT подкатегорий) —
+// админка шлёт форму целиком, но загрузка файлов сохраняет URL отдельно,
+// не перетирая остальное.
+app.put('/api/admin/story-cards/:id', requireAuth, async (req, res) => {
+  const { title, priceLabel, coverImageUrl, videoUrl, durationSeconds, badgeText, productId, sortOrder, isActive } = req.body || {};
+  try {
+    const existing = await query('SELECT * FROM story_cards WHERE id = $1', [req.params.id]);
+    const cur = existing.rows[0];
+    if (!cur) return res.status(404).json({ error: 'Карточка не найдена' });
+    const result = await query(
+      `UPDATE story_cards SET
+         title = $1, price_label = $2, cover_image_url = $3, video_url = $4,
+         duration_seconds = $5, badge_text = $6, product_id = $7, sort_order = $8, is_active = $9
+       WHERE id = $10 RETURNING *`,
+      [
+        title !== undefined ? String(title).trim() : cur.title,
+        priceLabel !== undefined ? String(priceLabel).trim() : cur.price_label,
+        coverImageUrl !== undefined ? (coverImageUrl || null) : cur.cover_image_url,
+        videoUrl !== undefined ? (videoUrl || null) : cur.video_url,
+        durationSeconds !== undefined ? (Number(durationSeconds) || 0) : cur.duration_seconds,
+        badgeText !== undefined ? (badgeText ? String(badgeText).trim() : null) : cur.badge_text,
+        productId !== undefined ? (productId || null) : cur.product_id,
+        sortOrder !== undefined ? (Number(sortOrder) || 0) : cur.sort_order,
+        isActive !== undefined ? Boolean(isActive) : cur.is_active,
+        req.params.id,
+      ]
+    );
+    res.json(toStoryCardDTO(result.rows[0]));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Файлы в S3 при удалении карточки не трогаем — публичная ссылка могла уже
+// уйти наружу, а место в бакете дешевле неожиданно битой ссылки. Чистка
+// осиротевших объектов — отдельная задача, если понадобится.
+app.delete('/api/admin/story-cards/:id', requireAuth, async (req, res) => {
+  try {
+    const result = await query('DELETE FROM story_cards WHERE id = $1 RETURNING id', [req.params.id]);
+    if (!result.rows[0]) return res.status(404).json({ error: 'Карточка не найдена' });
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
