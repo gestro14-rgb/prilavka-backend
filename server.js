@@ -3509,9 +3509,21 @@ app.post('/api/admin/story-cards/upload-url', requireAuth, async (req, res) => {
       new PutObjectCommand({ Bucket: S3_BUCKET, Key: key, ContentType: contentType }),
       { expiresIn: STORY_UPLOAD_URL_TTL_SEC }
     );
-    // Path-style, как и клиент (forcePathStyle в s3.js) — иначе публичная
-    // ссылка не совпала бы с адресом, по которому реально лежит объект.
-    const publicUrl = `${process.env.S3_ENDPOINT.replace(/\/+$/, '')}/${S3_BUCKET}/${key}`;
+    // База публичной ссылки. По умолчанию — сам S3-эндпоинт в path-style,
+    // как у клиента (forcePathStyle в s3.js).
+    //
+    // S3_PUBLIC_BASE_URL позволяет отдать другой хост, не трогая код: у
+    // Selectel «публичность» контейнера работает через их Swift/CDN-домен,
+    // а НЕ через S3-эндпоинт — по s3.ru-7.storage.selcloud.ru объекты
+    // отдаются с 403 даже когда контейнер помечен публичным (проверено на
+    // живом бакете: и presigned-загрузка, и файл, залитый вручную через
+    // панель, читаются только по своему публичному домену). Если публичный
+    // доступ решён бакет-политикой на самом S3 — переменную можно не
+    // задавать, дефолт останется рабочим.
+    const publicBase = process.env.S3_PUBLIC_BASE_URL
+      ? process.env.S3_PUBLIC_BASE_URL.replace(/\/+$/, '')
+      : `${String(process.env.S3_ENDPOINT || '').replace(/\/+$/, '')}/${S3_BUCKET}`;
+    const publicUrl = `${publicBase}/${key}`;
     res.json({ uploadUrl, publicUrl, key, expiresIn: STORY_UPLOAD_URL_TTL_SEC });
   } catch (e) {
     console.error('S3 presign error:', e);
