@@ -5,7 +5,7 @@ import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import 'dotenv/config';
 import { pool, query } from './db.js';
-import { s3Client, S3_BUCKET } from './s3.js';
+import { s3Client, s3PresignClient, S3_BUCKET } from './s3.js';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { v2 as cloudinary } from 'cloudinary';
@@ -3504,8 +3504,10 @@ app.post('/api/admin/story-cards/upload-url', requireAuth, async (req, res) => {
       ? String(fileName).split('.').pop().toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 5)
       : '';
     const key = `${prefix}/${crypto.randomUUID()}${ext ? `.${ext}` : ''}`;
+    // s3PresignClient, а не s3Client: подпись должна быть под тот хост,
+    // который умеет отвечать на CORS-preflight (см. s3.js).
     const uploadUrl = await getSignedUrl(
-      s3Client,
+      s3PresignClient,
       new PutObjectCommand({ Bucket: S3_BUCKET, Key: key, ContentType: contentType }),
       { expiresIn: STORY_UPLOAD_URL_TTL_SEC }
     );
