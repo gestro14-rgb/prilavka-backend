@@ -6,8 +6,10 @@ import crypto from 'crypto';
 import 'dotenv/config';
 import { pool, query } from './db.js';
 import { s3Client, s3PresignClient, S3_BUCKET } from './s3.js';
-import { PutObjectCommand } from '@aws-sdk/client-s3';
+import { PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { Upload } from '@aws-sdk/lib-storage';
+import busboy from 'busboy';
 import { v2 as cloudinary } from 'cloudinary';
 import multer from 'multer';
 
@@ -3476,10 +3478,43 @@ app.delete('/api/admin/rewards/:id', requireAuth, async (req, res) => {
 // Бакет публичный на чтение, поэтому presigned нужен только на запись
 // (GET-ссылки постоянные, без срока жизни — их и храним в БД).
 //
-// ВАЖНО: браузеру нужен CORS-доступ к бакету на PUT с origin админки —
-// это настраивается в панели Selectel, кодом не лечится.
+// ВАЖНО: этот путь НЕ РАБОТАЕТ из браузера — Selectel не отвечает на
+// CORS-preflight, когда в URL есть presigned-параметры (см. подробности в
+// s3.js). Реальная загрузка из админки идёт через прокси-эндпоинт
+// /api/admin/story-cards/upload ниже. Ручка оставлена рабочей на случай,
+// если провайдер починит preflight на своей стороне.
 const STORY_UPLOAD_URL_TTL_SEC = 15 * 60;
 const STORY_ALLOWED_KINDS = { video: 'stories/video', cover: 'stories/cover' };
+
+// Лимит размера файла. Сторис — ролики на 7–75 секунд; 200 МБ с большим
+// запасом покрывают даже минуту с телефона в высоком битрейте, но не дают
+// залить в витрину произвольно тяжёлый файл.
+const STORY_UPLOAD_MAX_BYTES = 200 * 1024 * 1024;
+
+// База публичной ссылки. По умолчанию — сам S3-эндпоинт в path-style, как
+// у клиента (forcePathStyle в s3.js).
+//
+// S3_PUBLIC_BASE_URL позволяет отдать другой хост, не трогая код: у
+// Selectel «публичность» контейнера работает через их Swift/CDN-домен, а
+// НЕ через S3-эндпоинт — по s3.ru-7.storage.selcloud.ru объекты отдаются с
+// 403 даже когда контейнер помечен публичным (проверено на живом бакете:
+// и загруженный по API файл, и залитый вручную через панель, читаются
+// только по своему публичному домену).
+function storyPublicUrl(key) {
+  const base = process.env.S3_PUBLIC_BASE_URL
+    ? process.env.S3_PUBLIC_BASE_URL.replace(/\/+$/, '')
+    : `${String(process.env.S3_ENDPOINT || '').replace(/\/+$/, '')}/${S3_BUCKET}`;
+  return `${base}/${key}`;
+}
+
+// Расширение берём из имени файла, а не из mime — mime-типы видео
+// (video/quicktime) не мапятся на расширение однозначно.
+function storyObjectKey(prefix, fileName) {
+  const ext = String(fileName || '').includes('.')
+    ? String(fileName).split('.').pop().toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 5)
+    : '';
+  return `${prefix}/${crypto.randomUUID()}${ext ? `.${ext}` : ''}`;
+}
 
 app.post('/api/admin/story-cards/upload-url', requireAuth, async (req, res) => {
   const { kind, contentType, fileName } = req.body || {};
@@ -3503,34 +3538,119 @@ app.post('/api/admin/story-cards/upload-url', requireAuth, async (req, res) => {
     const ext = String(fileName || '').includes('.')
       ? String(fileName).split('.').pop().toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 5)
       : '';
-    const key = `${prefix}/${crypto.randomUUID()}${ext ? `.${ext}` : ''}`;
-    // s3PresignClient, а не s3Client: подпись должна быть под тот хост,
-    // который умеет отвечать на CORS-preflight (см. s3.js).
+    const key = storyObjectKey(prefix, fileName);
+    // s3PresignClient, а не s3Client: подпись под хост, который в принципе
+    // умеет отвечать на CORS-preflight (см. s3.js).
     const uploadUrl = await getSignedUrl(
       s3PresignClient,
       new PutObjectCommand({ Bucket: S3_BUCKET, Key: key, ContentType: contentType }),
       { expiresIn: STORY_UPLOAD_URL_TTL_SEC }
     );
-    // База публичной ссылки. По умолчанию — сам S3-эндпоинт в path-style,
-    // как у клиента (forcePathStyle в s3.js).
-    //
-    // S3_PUBLIC_BASE_URL позволяет отдать другой хост, не трогая код: у
-    // Selectel «публичность» контейнера работает через их Swift/CDN-домен,
-    // а НЕ через S3-эндпоинт — по s3.ru-7.storage.selcloud.ru объекты
-    // отдаются с 403 даже когда контейнер помечен публичным (проверено на
-    // живом бакете: и presigned-загрузка, и файл, залитый вручную через
-    // панель, читаются только по своему публичному домену). Если публичный
-    // доступ решён бакет-политикой на самом S3 — переменную можно не
-    // задавать, дефолт останется рабочим.
-    const publicBase = process.env.S3_PUBLIC_BASE_URL
-      ? process.env.S3_PUBLIC_BASE_URL.replace(/\/+$/, '')
-      : `${String(process.env.S3_ENDPOINT || '').replace(/\/+$/, '')}/${S3_BUCKET}`;
-    const publicUrl = `${publicBase}/${key}`;
-    res.json({ uploadUrl, publicUrl, key, expiresIn: STORY_UPLOAD_URL_TTL_SEC });
+    res.json({ uploadUrl, publicUrl: storyPublicUrl(key), key, expiresIn: STORY_UPLOAD_URL_TTL_SEC });
   } catch (e) {
     console.error('S3 presign error:', e);
     res.status(500).json({ error: 'Не удалось подготовить ссылку для загрузки' });
   }
+});
+
+// Загрузка файла сторис ЧЕРЕЗ бэкенд (multipart/form-data, поле "file",
+// вид — в ?kind=video|cover). Это рабочий путь загрузки из админки: прямой
+// presigned PUT из браузера в Selectel невозможен, потому что их шлюз не
+// отдаёт CORS-заголовки на запись (детали в s3.js).
+//
+// Тело НЕ буферизуется: busboy отдаёт поток файла, lib-storage режет его на
+// части и грузит в S3 по мере поступления. Ради этого здесь busboy, а не
+// multer (как в /api/admin/upload-image) — multer держит файл целиком в
+// памяти, что для видео на сотню мегабайт неприемлемо.
+app.post('/api/admin/story-cards/upload', requireAuth, (req, res) => {
+  const kind = String(req.query.kind || '');
+  const prefix = STORY_ALLOWED_KINDS[kind];
+  if (!prefix) {
+    return res.status(400).json({ error: "kind должен быть 'video' или 'cover'" });
+  }
+  if (!S3_BUCKET) {
+    return res.status(500).json({ error: 'S3 не настроен: не задан S3_BUCKET' });
+  }
+
+  let bb;
+  try {
+    bb = busboy({ headers: req.headers, limits: { files: 1, fileSize: STORY_UPLOAD_MAX_BYTES } });
+  } catch {
+    return res.status(400).json({ error: 'Ожидается multipart/form-data' });
+  }
+
+  // Ответить можно только один раз: сюда ведут несколько независимых путей
+  // (ошибка разбора, превышение лимита, ошибка S3, успех).
+  let settled = false;
+  const reply = (status, body) => {
+    if (settled) return;
+    settled = true;
+    res.status(status).json(body);
+  };
+
+  let sawFile = false;
+
+  bb.on('file', (_field, stream, info) => {
+    sawFile = true;
+    const { filename, mimeType } = info;
+    const expected = kind === 'video' ? 'video/' : 'image/';
+    if (!mimeType || !mimeType.startsWith(expected)) {
+      // Поток обязательно осушить, иначе запрос повиснет до таймаута.
+      stream.resume();
+      return reply(400, { error: `Для kind=${kind} ожидается файл ${expected}*` });
+    }
+
+    const key = storyObjectKey(prefix, filename);
+    let tooLarge = false;
+
+    const upload = new Upload({
+      client: s3Client,
+      params: { Bucket: S3_BUCKET, Key: key, Body: stream, ContentType: mimeType },
+      partSize: 8 * 1024 * 1024,
+      queueSize: 2,
+    });
+
+    // Лимит busboy обрезает поток молча — без abort() в S3 уехал бы
+    // «успешно загруженный» обрезанный файл.
+    stream.on('limit', () => {
+      tooLarge = true;
+      upload.abort().catch(() => { /* уже могло завершиться */ });
+    });
+
+    const cleanupPartial = async () => {
+      try {
+        await s3Client.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: key }));
+      } catch { /* объекта может и не быть — это нормально */ }
+    };
+
+    upload.done()
+      .then(async () => {
+        if (tooLarge) {
+          await cleanupPartial();
+          return reply(413, { error: `Файл больше ${Math.round(STORY_UPLOAD_MAX_BYTES / 1024 / 1024)} МБ` });
+        }
+        reply(200, { url: storyPublicUrl(key), key });
+      })
+      .catch(async (e) => {
+        await cleanupPartial();
+        if (tooLarge) {
+          return reply(413, { error: `Файл больше ${Math.round(STORY_UPLOAD_MAX_BYTES / 1024 / 1024)} МБ` });
+        }
+        console.error('S3 stream upload error:', e);
+        reply(500, { error: 'Не удалось загрузить файл в хранилище' });
+      });
+  });
+
+  bb.on('close', () => {
+    if (!sawFile) reply(400, { error: 'Файл не получен' });
+  });
+
+  bb.on('error', (e) => {
+    console.error('busboy error:', e);
+    reply(500, { error: 'Ошибка разбора запроса' });
+  });
+
+  req.pipe(bb);
 });
 
 app.get('/api/admin/story-cards', requireAuth, async (req, res) => {
