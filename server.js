@@ -3617,6 +3617,17 @@ app.post('/api/admin/story-cards/upload', requireAuth, (req, res) => {
       upload.abort().catch(() => { /* уже могло завершиться */ });
     });
 
+    // Клиент отвалился на полпути (закрыл вкладку, оборвалась сеть, или мы
+    // сами оборвали соединение отказом по лимиту). Без явного abort в
+    // хранилище остаётся незавершённая multipart-загрузка: объекта в
+    // листинге нет, а место занято — проверено на живом бакете.
+    const abortIfUnsettled = () => {
+      if (settled) return;
+      upload.abort().catch(() => { /* могло уже завершиться */ });
+    };
+    req.on('aborted', abortIfUnsettled);
+    res.on('close', abortIfUnsettled);
+
     const cleanupPartial = async () => {
       try {
         await s3Client.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: key }));
