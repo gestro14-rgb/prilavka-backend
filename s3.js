@@ -39,9 +39,22 @@ export const s3Client = new S3Client({ ...clientConfig, endpoint });
 // возвращает дословно), просто этот эндпоинт его не применяет.
 //
 // Публичный домен контейнера (S3_PRESIGN_ENDPOINT, тот же selstorage.ru,
-// что и для чтения) на OPTIONS отвечает 200 с корректными
-// Access-Control-Allow-* и принимает подписанный PUT по пути
-// /<bucket>/<key>. Проверено на живом бакете.
+// что и для чтения) принимает подписанный PUT по пути /<bucket>/<key> —
+// проверено на живом бакете (200).
+//
+// ВАЖНО, проверено в реальном браузере: для ЗАГРУЗКИ ИЗ БРАУЗЕРА это всё
+// равно не работает, и смена хоста проблему НЕ решает. Preflight проходит
+// только на голый путь; как только в URL появляются presigned-параметры
+// SigV4, Selectel уводит запрос в ветку S3-авторизации и отвечает на
+// OPTIONS "405" без Access-Control-*:
+//   OPTIONS /prilavka-stories/<key>                -> 200 + ACAO
+//   OPTIONS /prilavka-stories/<key>?X-Amz-Signature=... -> 405, ACAO нет
+// Chrome блокирует запрос с "Response to preflight request doesn't pass
+// access control check". Пропустить preflight для PUT нельзя, а POST-форма
+// (POST Object) не спасает — на её ответ Selectel тоже не отдаёт ACAO.
+// Вывод: прямая загрузка из браузера в это хранилище невозможна, нужен
+// прокси через бэкенд. Переменная оставлена как рабочая для серверных
+// подписей и на случай, если провайдер починит preflight.
 //
 // Не задан — поведение прежнее (подпись под обычный эндпоинт).
 const presignEndpoint = process.env.S3_PRESIGN_ENDPOINT;
