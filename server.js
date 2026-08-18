@@ -3607,7 +3607,13 @@ app.post('/api/admin/story-cards/upload', requireAuth, (req, res) => {
 
     const upload = new Upload({
       client: s3Client,
-      params: { Bucket: S3_BUCKET, Key: key, Body: stream, ContentType: mimeType },
+      // immutable безопасен — имя объекта содержит UUID (см. storyObjectKey),
+      // один и тот же ключ никогда не перезаписывается новым содержимым.
+      // Тот же паттерн, что у прокси аватарок (см. Cache-Control там же).
+      params: {
+        Bucket: S3_BUCKET, Key: key, Body: stream, ContentType: mimeType,
+        CacheControl: 'public, max-age=31536000, immutable',
+      },
       partSize: 8 * 1024 * 1024,
       queueSize: 2,
     });
