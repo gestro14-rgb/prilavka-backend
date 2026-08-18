@@ -3,6 +3,8 @@ import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
 import 'dotenv/config';
 import { pool, query } from './db.js';
 import { s3Client, s3PresignClient, S3_BUCKET } from './s3.js';
@@ -4155,6 +4157,33 @@ async function botRequest(method, body) {
   }
 }
 
+// Вариант botRequest для методов с файлом (sendPhoto и т.п.) — Bot API для
+// них требует multipart/form-data, не JSON. FormData/Blob — нативные (Node
+// 18+), fetch сам проставляет верный Content-Type с boundary; вручную его
+// задавать нельзя — сломает границу между полями.
+async function botRequestMultipart(method, { file, fileField, ...fields }) {
+  if (!TELEGRAM_BOT_TOKEN) return null;
+  try {
+    const form = new FormData();
+    for (const [key, value] of Object.entries(fields)) {
+      if (value === undefined) continue;
+      form.append(key, typeof value === 'string' ? value : JSON.stringify(value));
+    }
+    form.append(fileField, new Blob([file.buffer]), file.filename);
+
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
+      method: 'POST',
+      body: form,
+    });
+    const data = await res.json();
+    if (!data.ok) console.error(`botRequestMultipart ${method} failed:`, data);
+    return data.ok ? data.result : null;
+  } catch (e) {
+    console.error(`botRequestMultipart ${method} error:`, e);
+    return null;
+  }
+}
+
 // Пытается получить file_id аватарки пользователя из Telegram (для карточки
 // отзыва на главной). Берём самый маленький доступный размер фото — для
 // круглого аватара 26px незачем тянуть 640x640. Храним именно file_id (не
@@ -4229,6 +4258,13 @@ const START_MESSAGE = `<b>Привет! 👋 Я Михаил.
 
 👇 Нажмите «Прилавка», чтобы выбрать продукты.</b>`;
 
+// Фото для приветствия — читаем один раз при старте процесса, а не на
+// каждый /start: статичный файл, лишний disk I/O на каждое сообщение не
+// нужен, а падать (если файла нет) лучше сразу при запуске, а не молча
+// на первом реальном /start.
+const START_PHOTO_PATH = fileURLToPath(new URL('./assets/IMG_8571.PNG', import.meta.url));
+const START_PHOTO_BUFFER = fs.readFileSync(START_PHOTO_PATH);
+
 // Принимает апдейты от Telegram (сейчас только текстовые сообщения — см.
 // allowed_updates в registerWebhook). Проверяем секрет, чтобы левые POST-запросы
 // не могли слать сообщения от имени бота случайным chat_id.
@@ -4243,9 +4279,11 @@ app.post('/telegram-webhook', async (req, res) => {
 
   // /start (в том числе с реферальным диплинком "/start ref_XXXXX")
   if (msg.text === '/start' || msg.text.startsWith('/start ')) {
-    await botRequest('sendMessage', {
+    await botRequestMultipart('sendPhoto', {
+      file: { buffer: START_PHOTO_BUFFER, filename: 'start-photo.png' },
+      fileField: 'photo',
       chat_id: msg.chat.id,
-      text: START_MESSAGE,
+      caption: START_MESSAGE,
       parse_mode: 'HTML',
       reply_markup: {
         inline_keyboard: [[
