@@ -3667,6 +3667,16 @@ async function handleVideoUpload({ stream, filename, prefix, reply, req, res, is
   let tooLarge = false;
   stream.on('limit', () => { tooLarge = true; });
 
+  // Отдельный флаг вместо req.destroyed: у req включён autoDestroy, поэтому
+  // сразу после того, как тело запроса дочитано до конца, req.destroyed
+  // становится true и на штатном пути тоже. Проверка по нему молча
+  // прекращала обработку ещё до ffmpeg и не отвечала вовсе — запрос висел
+  // до 5-минутного таймаута прокси Railway (502 upstream error).
+  let clientGone = false;
+  const markGone = () => { if (!isSettled()) clientGone = true; };
+  req.on('aborted', markGone);
+  res.on('close', markGone);
+
   const cleanupTmp = async () => {
     try { await fs.promises.rm(tmpDir, { recursive: true, force: true }); } catch { /* уже нет — не страшно */ }
   };
@@ -3682,7 +3692,7 @@ async function handleVideoUpload({ stream, filename, prefix, reply, req, res, is
     }
     // Клиент мог отвалиться, пока шла заливка на диск — тогда ffmpeg
     // запускать уже незачем, ответ всё равно никто не прочитает.
-    if (isSettled() || req.destroyed) {
+    if (isSettled() || clientGone) {
       await cleanupTmp();
       return;
     }
@@ -3696,7 +3706,7 @@ async function handleVideoUpload({ stream, filename, prefix, reply, req, res, is
       `${(outBytes / 1024 / 1024).toFixed(1)}МБ за ${((Date.now() - startedAt) / 1000).toFixed(1)}с (${key})`
     );
 
-    if (isSettled() || req.destroyed) {
+    if (isSettled() || clientGone) {
       await cleanupTmp();
       return;
     }
