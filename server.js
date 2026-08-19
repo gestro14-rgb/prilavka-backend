@@ -4,6 +4,10 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { spawn } from 'child_process';
+import { pipeline } from 'stream/promises';
 import { fileURLToPath } from 'url';
 import 'dotenv/config';
 import { pool, query } from './db.js';
@@ -3518,6 +3522,93 @@ function storyObjectKey(prefix, fileName) {
   return `${prefix}/${crypto.randomUUID()}${ext ? `.${ext}` : ''}`;
 }
 
+// ── Транскодирование видео сторис ────────────────────────────────────────────
+//
+// Исходники — сырой экспорт с телефона: 1920x1080@60fps H.264 на 22-23 Мбит/с,
+// 20-29 МБ на 7-10 секунд. Во StoryViewer это показывается в боксе шириной до
+// ~480px CSS, то есть избыточно примерно на порядок и было главным вкладом в
+// задержку старта видео (см. разведку: readyState залипал на HAVE_METADATA,
+// пока файл качался).
+//
+// Целевой бокс — ПОРТРЕТНЫЙ. Исходники сняты на телефон: в потоке лежат как
+// 1920x1080, но с матрицей поворота (rotation=-90), то есть реально
+// отображаются как 1080x1920. ffmpeg применяет поворот до фильтров, поэтому
+// iw/ih ниже — уже повёрнутые размеры, и бокс должен быть 720x1280, иначе
+// портрет вписывается в ландшафтный бокс и схлопывается до ~404px по ширине.
+// Кадрирование под 3:4 вьюера по-прежнему делает CSS (object-fit: cover) —
+// на сервере кадр не режем, чтобы не сдвинуть то, что попадает в кадр.
+const TRANSCODE_MAX_WIDTH = 720;
+const TRANSCODE_MAX_HEIGHT = 1280;
+const TRANSCODE_FPS = 30;    // исходные ~60 для еды крупным планом не нужны
+// Качество вместо жёсткого битрейта: на малоподвижном контенте даёт меньший
+// размер при том же виде. 26 подобран замером на реальном ролике — 2.35 Мбит/с
+// против 3.47 у CRF 23, покадровое сравнение с оригиналом отличий не выявило.
+const TRANSCODE_CRF = 26;
+const TRANSCODE_TIMEOUT_MS = 4 * 60 * 1000;
+
+// ffmpeg пишет прогресс в stderr и может там накопить много — не даём буферу
+// расти бесконечно, для диагностики хватает хвоста.
+const FFMPEG_STDERR_KEEP_CHARS = 4000;
+
+/**
+ * Перекодирует видеофайл под веб-доставку. Возвращает промис, который
+ * резолвится, когда outPath готов. Всегда убивает процесс по таймауту —
+ * иначе зависший ffmpeg держал бы HTTP-запрос до его собственного таймаута.
+ */
+function transcodeStoryVideo(inPath, outPath) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-i', inPath,
+      // Вписать в 1280x720 с сохранением пропорций; -2 держит чётность
+      // размеров (обязательна для yuv420p) и не апскейлит то, что и так меньше.
+      '-vf', `scale='min(${TRANSCODE_MAX_WIDTH},iw)':'min(${TRANSCODE_MAX_HEIGHT},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=${TRANSCODE_FPS}`,
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-crf', String(TRANSCODE_CRF),
+      // yuv420p — иначе часть мобильных плееров не покажет картинку вовсе.
+      '-pix_fmt', 'yuv420p',
+      // Звук вырезаем целиком: сторис жёстко muted без какого-либо UI для
+      // включения звука (StoryViewer.jsx), дорожку физически невозможно
+      // услышать — это бесплатные ~10% веса.
+      '-an',
+      // moov-атом в начало файла: без этого плеер не может начать
+      // проигрывание, пока не скачает файл целиком.
+      '-movflags', '+faststart',
+      '-y', outPath,
+    ];
+
+    const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    let timedOut = false;
+
+    proc.stderr.on('data', (chunk) => {
+      stderr = (stderr + chunk.toString()).slice(-FFMPEG_STDERR_KEEP_CHARS);
+    });
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      proc.kill('SIGKILL');
+    }, TRANSCODE_TIMEOUT_MS);
+
+    proc.on('error', (e) => {
+      clearTimeout(timer);
+      // ENOENT здесь — ffmpeg не установлен в образе (см. railpack.json).
+      reject(new Error(`Не удалось запустить ffmpeg: ${e.message}`));
+    });
+
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (timedOut) {
+        return reject(new Error(`ffmpeg превысил лимит ${TRANSCODE_TIMEOUT_MS / 1000}с и был остановлен`));
+      }
+      if (code !== 0) {
+        return reject(new Error(`ffmpeg завершился с кодом ${code}: ${stderr.slice(-800)}`));
+      }
+      resolve();
+    });
+  });
+}
+
 app.post('/api/admin/story-cards/upload-url', requireAuth, async (req, res) => {
   const { kind, contentType, fileName } = req.body || {};
   const prefix = STORY_ALLOWED_KINDS[kind];
@@ -3554,6 +3645,90 @@ app.post('/api/admin/story-cards/upload-url', requireAuth, async (req, res) => {
     res.status(500).json({ error: 'Не удалось подготовить ссылку для загрузки' });
   }
 });
+
+/**
+ * Приём видео сторис: поток → временный файл → ffmpeg → временный файл →
+ * S3. Синхронно в рамках HTTP-запроса (для одного админа, загружающего
+ * сторис вручную, это приемлемо; очередь была бы оверинжинирингом при
+ * текущем объёме — при желании сюда же позже вставляется фоновая задача).
+ *
+ * Ключ в S3 всегда .mp4 независимо от исходного расширения — на выходе
+ * ffmpeg всегда mp4, и отдавать .mov-ключ для mp4-содержимого нельзя.
+ */
+async function handleVideoUpload({ stream, filename, prefix, reply, req, res, isSettled }) {
+  const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'story-'));
+  const srcExt = String(filename || '').includes('.')
+    ? String(filename).split('.').pop().toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 5)
+    : 'bin';
+  const inPath = path.join(tmpDir, `in.${srcExt || 'bin'}`);
+  const outPath = path.join(tmpDir, 'out.mp4');
+  const key = `${prefix}/${crypto.randomUUID()}.mp4`;
+
+  let tooLarge = false;
+  stream.on('limit', () => { tooLarge = true; });
+
+  const cleanupTmp = async () => {
+    try { await fs.promises.rm(tmpDir, { recursive: true, force: true }); } catch { /* уже нет — не страшно */ }
+  };
+
+  try {
+    // pipeline закроет дескриптор и на ошибке тоже — иначе на неудачных
+    // загрузках копились бы висящие файлы во временной папке.
+    await pipeline(stream, fs.createWriteStream(inPath));
+
+    if (tooLarge) {
+      await cleanupTmp();
+      return reply(413, { error: `Файл больше ${Math.round(STORY_UPLOAD_MAX_BYTES / 1024 / 1024)} МБ` });
+    }
+    // Клиент мог отвалиться, пока шла заливка на диск — тогда ffmpeg
+    // запускать уже незачем, ответ всё равно никто не прочитает.
+    if (isSettled() || req.destroyed) {
+      await cleanupTmp();
+      return;
+    }
+
+    const srcBytes = (await fs.promises.stat(inPath)).size;
+    const startedAt = Date.now();
+    await transcodeStoryVideo(inPath, outPath);
+    const outBytes = (await fs.promises.stat(outPath)).size;
+    console.log(
+      `story video transcoded: ${(srcBytes / 1024 / 1024).toFixed(1)}МБ → ` +
+      `${(outBytes / 1024 / 1024).toFixed(1)}МБ за ${((Date.now() - startedAt) / 1000).toFixed(1)}с (${key})`
+    );
+
+    if (isSettled() || req.destroyed) {
+      await cleanupTmp();
+      return;
+    }
+
+    const upload = new Upload({
+      client: s3Client,
+      params: {
+        Bucket: S3_BUCKET, Key: key, Body: fs.createReadStream(outPath),
+        ContentType: 'video/mp4',
+        CacheControl: 'public, max-age=31536000, immutable',
+      },
+      partSize: 8 * 1024 * 1024,
+      queueSize: 2,
+    });
+    const abortIfUnsettled = () => {
+      if (isSettled()) return;
+      upload.abort().catch(() => { /* могло уже завершиться */ });
+    };
+    req.on('aborted', abortIfUnsettled);
+    res.on('close', abortIfUnsettled);
+
+    await upload.done();
+    reply(200, { url: storyPublicUrl(key), key });
+  } catch (e) {
+    console.error('story video upload/transcode error:', e);
+    // Объекта в S3 на этом пути ещё нет (заливка идёт последним шагом и
+    // при её падении lib-storage сам обрывает multipart) — чистим только диск.
+    reply(500, { error: 'Не удалось обработать видео' });
+  } finally {
+    await cleanupTmp();
+  }
+}
 
 // Загрузка файла сторис ЧЕРЕЗ бэкенд (multipart/form-data, поле "file",
 // вид — в ?kind=video|cover). Это рабочий путь загрузки из админки: прямой
@@ -3600,6 +3775,14 @@ app.post('/api/admin/story-cards/upload', requireAuth, (req, res) => {
       // Поток обязательно осушить, иначе запрос повиснет до таймаута.
       stream.resume();
       return reply(400, { error: `Для kind=${kind} ожидается файл ${expected}*` });
+    }
+
+    // Видео идёт через ffmpeg и потому через диск: ffmpeg не умеет читать
+    // из пайпа и одновременно писать mp4 с moov-атомом в начале (длину
+    // потока нужно знать заранее). Обложки как грузились напрямую в S3
+    // без промежуточного файла, так и грузятся.
+    if (kind === 'video') {
+      return handleVideoUpload({ stream, filename, prefix, reply, req, res, isSettled: () => settled });
     }
 
     const key = storyObjectKey(prefix, filename);
