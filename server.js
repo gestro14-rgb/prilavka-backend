@@ -3952,6 +3952,27 @@ app.delete('/api/admin/story-cards/:id', requireAuth, async (req, res) => {
   }
 });
 
+// Удаление произвольного объекта сторис из S3 по ключу — для расчистки
+// мусора (осиротевшие оригиналы, тестовые загрузки), не привязанного ни к
+// одной строке story_cards. Ключ ограничен префиксом stories/, чтобы
+// опечатка или чужой ключ не задели что-то за пределами этой фичи.
+app.delete('/api/admin/story-media', requireAuth, async (req, res) => {
+  const key = String(req.query.key || req.body?.key || '');
+  if (!key.startsWith('stories/')) {
+    return res.status(400).json({ error: 'key должен начинаться с stories/' });
+  }
+  if (!S3_BUCKET) {
+    return res.status(500).json({ error: 'S3 не настроен: не задан S3_BUCKET' });
+  }
+  try {
+    await s3Client.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: key }));
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('S3 delete error:', e);
+    res.status(500).json({ error: 'Не удалось удалить объект' });
+  }
+});
+
 // ============================================================
 // Админские маршруты — статистика
 // ============================================================
