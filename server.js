@@ -124,6 +124,10 @@ function toProductDTO(row) {
     // Отдельная картинка для блока "Готовые наборы" на Главной — независима
     // от imageUrl (карточка/страница товара). Пусто → фронт сам берёт imageUrl.
     homeImageUrl: row.home_image_url || null,
+    // Видео набора для hero-блока Главной (migrations/048). Непустое
+    // значение = набор участвует в hero-карусели — отдельного флага/списка
+    // нет, см. heroSets в Home.jsx.
+    homeVideoUrl: row.home_video_url || null,
     isBundle: row.is_bundle ?? false,
     subcategoryId: row.subcategory_id ?? null,
     nutrition: row.nutrition ?? null,
@@ -2281,8 +2285,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
       : null;
     await query(
       `INSERT INTO products
-        (id, slug, title, price, old_price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg, individual_margin_percent, price_per_kg)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)`,
+        (id, slug, title, price, old_price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg, individual_margin_percent, price_per_kg, home_video_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)`,
       [
         p.id,
         p.slug || p.id,
@@ -2312,6 +2316,7 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
         weightKg,
         individualMargin,
         pricePerKg,
+        p.homeVideoUrl || null,
       ]
     );
     const result = await query('SELECT * FROM products WHERE id = $1', [p.id]);
@@ -2385,8 +2390,9 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         individual_margin_percent = $25,
         old_price = $26,
         price_per_kg = $27,
+        home_video_url = $28,
         updated_at = now()
-       WHERE id = $28`,
+       WHERE id = $29`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -2419,6 +2425,7 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         individualMargin,
         p.oldPrice !== undefined ? (p.oldPrice !== '' && p.oldPrice != null ? p.oldPrice : null) : cur.old_price,
         pricePerKg,
+        p.homeVideoUrl !== undefined ? (p.homeVideoUrl || null) : (cur.home_video_url || null),
         req.params.id,
       ]
     );
@@ -3490,7 +3497,18 @@ app.delete('/api/admin/rewards/:id', requireAuth, async (req, res) => {
 // /api/admin/story-cards/upload ниже. Ручка оставлена рабочей на случай,
 // если провайдер починит preflight на своей стороне.
 const STORY_UPLOAD_URL_TTL_SEC = 15 * 60;
-const STORY_ALLOWED_KINDS = { video: 'stories/video', cover: 'stories/cover' };
+// setVideo — видео набора для hero-блока Главной (migrations/048). Отдельный
+// префикс, а не stories/video: в одном бакете иначе не отличить видео набора
+// от видео сторис, а чистка мусора идёт именно по префиксам. Пайплайн тот же
+// (busboy + ffmpeg + заливка потоком) — обработка выбирается по типу файла,
+// а не по kind, поэтому достаточно записи в этой таблице.
+const STORY_ALLOWED_KINDS = { video: 'stories/video', cover: 'stories/cover', setVideo: 'sets/video' };
+
+// Какие kind несут видео (а не картинку): от этого зависит и ожидаемый
+// content-type, и то, гнать ли файл через ffmpeg. Проверять по списку, а не
+// сравнением kind === 'video', иначе каждый новый видео-kind пришлось бы
+// дописывать в три разных места.
+const STORY_VIDEO_KINDS = new Set(['video', 'setVideo']);
 
 // Лимит размера файла. Сторис — ролики на 7–75 секунд; 200 МБ с большим
 // запасом покрывают даже минуту с телефона в высоком битрейте, но не дают
@@ -3613,12 +3631,12 @@ app.post('/api/admin/story-cards/upload-url', requireAuth, async (req, res) => {
   const { kind, contentType, fileName } = req.body || {};
   const prefix = STORY_ALLOWED_KINDS[kind];
   if (!prefix) {
-    return res.status(400).json({ error: "kind должен быть 'video' или 'cover'" });
+    return res.status(400).json({ error: `kind должен быть одним из: ${Object.keys(STORY_ALLOWED_KINDS).join(', ')}` });
   }
   if (!contentType || typeof contentType !== 'string') {
     return res.status(400).json({ error: 'Укажите contentType файла' });
   }
-  const expectedPrefix = kind === 'video' ? 'video/' : 'image/';
+  const expectedPrefix = STORY_VIDEO_KINDS.has(kind) ? 'video/' : 'image/';
   if (!contentType.startsWith(expectedPrefix)) {
     return res.status(400).json({ error: `Для kind=${kind} ожидается contentType ${expectedPrefix}*` });
   }
@@ -3753,7 +3771,7 @@ app.post('/api/admin/story-cards/upload', requireAuth, (req, res) => {
   const kind = String(req.query.kind || '');
   const prefix = STORY_ALLOWED_KINDS[kind];
   if (!prefix) {
-    return res.status(400).json({ error: "kind должен быть 'video' или 'cover'" });
+    return res.status(400).json({ error: `kind должен быть одним из: ${Object.keys(STORY_ALLOWED_KINDS).join(', ')}` });
   }
   if (!S3_BUCKET) {
     return res.status(500).json({ error: 'S3 не настроен: не задан S3_BUCKET' });
@@ -3780,7 +3798,7 @@ app.post('/api/admin/story-cards/upload', requireAuth, (req, res) => {
   bb.on('file', (_field, stream, info) => {
     sawFile = true;
     const { filename, mimeType } = info;
-    const expected = kind === 'video' ? 'video/' : 'image/';
+    const expected = STORY_VIDEO_KINDS.has(kind) ? 'video/' : 'image/';
     if (!mimeType || !mimeType.startsWith(expected)) {
       // Поток обязательно осушить, иначе запрос повиснет до таймаута.
       stream.resume();
@@ -3791,7 +3809,7 @@ app.post('/api/admin/story-cards/upload', requireAuth, (req, res) => {
     // из пайпа и одновременно писать mp4 с moov-атомом в начале (длину
     // потока нужно знать заранее). Обложки как грузились напрямую в S3
     // без промежуточного файла, так и грузятся.
-    if (kind === 'video') {
+    if (STORY_VIDEO_KINDS.has(kind)) {
       return handleVideoUpload({ stream, filename, prefix, reply, req, res, isSettled: () => settled });
     }
 
