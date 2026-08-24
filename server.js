@@ -1170,11 +1170,24 @@ function plural(n, one, few, many) {
 // они разъезжались: корзина показывала отказ, а заказ молча уходил без скидки.
 // ordersCount — сколько заказов у пользователя УЖЕ есть; оформляемый сейчас
 // идёт следующим по счёту, поэтому ниже сравниваем с ordersCount + 1.
-function validatePromo(promo, { total, ordersCount }) {
+// usedByUser — применял ли этот клиент именно этот код раньше; считается
+// вызывающим через loadPromoContext ниже, чтобы сама функция осталась
+// синхронной и без обращений к базе.
+function validatePromo(promo, { total, ordersCount, usedByUser = false }) {
   if (!promo) {
     return { valid: false, message: 'Промокод не найден' };
   }
-  if (promo.is_used) {
+  // Одноразовость бывает двух видов (миграция 049). У именных кодов
+  // (once_global) она на весь код: первый применивший закрывает его для
+  // всех — это и есть замысел раздачи "лично Ольге". У массового
+  // приветственного кода (once_per_user) — на клиента: код общий, но
+  // каждому достаётся один раз, и глобальный is_used для него не смотрим
+  // вовсе, иначе первый же заказ сжёг бы код для всех остальных.
+  if (promo.usage_type === 'once_per_user') {
+    if (usedByUser) {
+      return { valid: false, message: 'Вы уже использовали этот промокод' };
+    }
+  } else if (promo.is_used) {
     return { valid: false, message: 'Промокод уже использован' };
   }
   if (promo.expires_at && new Date(promo.expires_at) < new Date()) {
@@ -1210,6 +1223,27 @@ function validatePromo(promo, { total, ordersCount }) {
   return { valid: true, discount: computeDiscount(promo, total || 0) };
 }
 
+// Собирает всё, что нужно validatePromo, по коду и клиенту. Отдельной
+// функцией — по той же причине, по которой сама validatePromo одна на два
+// места: корзина и сабмит заказа должны готовить контекст проверки
+// одинаково, иначе условия снова разъедутся между экраном и заказом.
+async function loadPromoContext(code, userId) {
+  const res = await query('SELECT * FROM promo_codes WHERE code = $1', [String(code).trim().toUpperCase()]);
+  const promo = res.rows[0];
+  const ordersCount = await countUserOrders(userId);
+  // Лишний запрос делаем только для кодов, которым он вообще нужен —
+  // у once_global одноразовость целиком в самом promo_codes.is_used.
+  let usedByUser = false;
+  if (promo && promo.usage_type === 'once_per_user') {
+    const used = await query(
+      'SELECT 1 FROM promo_code_uses WHERE promo_code_id = $1 AND user_id = $2 LIMIT 1',
+      [promo.id, userId]
+    );
+    usedByUser = used.rowCount > 0;
+  }
+  return { promo, ordersCount, usedByUser };
+}
+
 // Проверяет промокод и возвращает размер скидки, не списывая его.
 // Используется в корзине для предпросмотра скидки до оформления заказа.
 // resolveUser обязателен: без личности не посчитать номер заказа, а без него
@@ -1223,10 +1257,8 @@ app.post('/api/promo/check', resolveUser, async (req, res) => {
     return res.status(400).json({ error: 'Укажите промокод' });
   }
   try {
-    const result = await query('SELECT * FROM promo_codes WHERE code = $1', [String(code).trim().toUpperCase()]);
-    const promo = result.rows[0];
-    const ordersCount = await countUserOrders(req.userId);
-    const check = validatePromo(promo, { total, ordersCount });
+    const { promo, ordersCount, usedByUser } = await loadPromoContext(code, req.userId);
+    const check = validatePromo(promo, { total, ordersCount, usedByUser });
     if (!check.valid) {
       return res.json({ valid: false, message: check.message });
     }
@@ -1235,6 +1267,45 @@ app.post('/api/promo/check', resolveUser, async (req, res) => {
       discountType: promo.discount_type,
       discountValue: promo.discount_value,
       discount: check.discount,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Промокод для баннера на Главной. Публичный и намеренно без
+// пользовательского контекста: баннер маркетинговый, а не персональный, и
+// виден в том числе до входа — валидность конкретному клиенту всё равно
+// считает /api/promo/check при вводе кода в корзине.
+//
+// Какой код показывать, отдельным флагом "показывать в баннере" не помечаем:
+// массовый код — это ровно тот, у которого usage_type = 'once_per_user',
+// потому что раздаваемые лично именные коды по определению once_global и в
+// баннер попасть не могут. Одна колонка вместо двух, которые пришлось бы
+// держать согласованными вручную. Если таких кодов заведут несколько,
+// показываем самый свежий.
+app.get('/api/promo/featured', async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT * FROM promo_codes
+        WHERE usage_type = 'once_per_user'
+          AND is_used = false
+          AND (expires_at IS NULL OR expires_at > now())
+        ORDER BY created_at DESC
+        LIMIT 1`
+    );
+    const promo = result.rows[0];
+    if (!promo) return res.json(null);
+    res.json({
+      code: promo.code,
+      discountType: promo.discount_type,
+      discountValue: promo.discount_value,
+      minOrderTotal: promo.min_order_total,
+      // Баннер обещает скидку "на первый заказ" — текст должен следовать за
+      // данными, а не быть зашитым в вёрстку: код с другим условием
+      // (например на первые 3 заказа) подпишется иначе.
+      maxOrderNumber: promo.max_order_number,
     });
   } catch (e) {
     console.error(e);
@@ -1288,17 +1359,17 @@ app.post('/api/orders', resolveUser, async (req, res) => {
     let finalTotal = total;
     let appliedReferralCode = null;
 
-    // Применяем промокод (одноразовый, из таблицы promo_codes).
+    // Применяем промокод из таблицы promo_codes. Одноразовый — либо на весь
+    // код, либо на клиента, в зависимости от usage_type (см. validatePromo
+    // и миграцию 049).
     // Проверка — та же validatePromo, что и в предпросмотре корзины, поэтому
     // условия не могут разъехаться между экраном и сабмитом. Отказ теперь
     // возвращается ошибкой, а не проглатывается: раньше невалидный код просто
     // не применялся, и заказ уходил на полную сумму — пользователь видел в
     // корзине одну цифру, а получал другую, без единого сообщения.
     if (promoCode && String(promoCode).trim()) {
-      const promoRes = await query('SELECT * FROM promo_codes WHERE code = $1', [String(promoCode).trim().toUpperCase()]);
-      const promo = promoRes.rows[0];
-      const ordersCount = await countUserOrders(req.userId);
-      const check = validatePromo(promo, { total, ordersCount });
+      const { promo, ordersCount, usedByUser } = await loadPromoContext(promoCode, req.userId);
+      const check = validatePromo(promo, { total, ordersCount, usedByUser });
       if (!check.valid) {
         return res.status(400).json({ error: check.message });
       }
@@ -1400,12 +1471,28 @@ app.post('/api/orders', resolveUser, async (req, res) => {
 
     const order = result.rows[0];
 
-    // Промокод одноразовый — помечаем использованным сразу после успешного создания заказа.
+    // Фиксируем применение промокода сразу после успешного создания заказа.
     if (appliedPromo) {
+      // Строку в promo_code_uses пишем для любого вида кода — это общая
+      // история применений. Для once_per_user она же и есть механизм
+      // одноразовости, а уникальный индекс (promo_code_id, user_id) заодно
+      // ловит гонку двух одновременно оформляемых заказов, которую проверка
+      // выше пропускает. Заказ на этот момент уже создан, поэтому конфликт
+      // гасим DO NOTHING: отвечать 500-й на успешно оформленный заказ хуже,
+      // чем не записать дубль строки, которая и так уже есть.
       await query(
-        'UPDATE promo_codes SET is_used = true, used_at = now(), used_by_telegram_id = $1 WHERE id = $2',
-        [telegramUser?.id || null, appliedPromo.id]
+        `INSERT INTO promo_code_uses (promo_code_id, user_id, telegram_id, order_id)
+         VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
+        [appliedPromo.id, req.userId, telegramUser?.id || null, order.id]
       );
+      // is_used гасит код целиком, для всех — это верно только для именных
+      // (once_global). Массовый приветственный код так помечать нельзя.
+      if (appliedPromo.usage_type !== 'once_per_user') {
+        await query(
+          'UPDATE promo_codes SET is_used = true, used_at = now(), used_by_telegram_id = $1 WHERE id = $2',
+          [telegramUser?.id || null, appliedPromo.id]
+        );
+      }
     }
 
     // Списываем баллы после успешного создания заказа
@@ -2996,6 +3083,7 @@ function toPromoDTO(row) {
     discountType: row.discount_type,
     discountValue: row.discount_value,
     minOrderTotal: row.min_order_total,
+    usageType: row.usage_type,
     isUsed: row.is_used,
     usedAt: row.used_at,
     expiresAt: row.expires_at,
@@ -3034,7 +3122,7 @@ app.get('/api/admin/promo-codes', requireAuth, async (req, res) => {
 
 // Создать промокод
 app.post('/api/admin/promo-codes', requireAuth, async (req, res) => {
-  const { code, discountType, discountValue, minOrderTotal, expiresAt, orderCondition, orderConditionN } = req.body || {};
+  const { code, discountType, discountValue, minOrderTotal, expiresAt, orderCondition, orderConditionN, usageType } = req.body || {};
   if (!code || !String(code).trim() || !discountValue) {
     return res.status(400).json({ error: 'Укажите код и размер скидки' });
   }
@@ -3042,11 +3130,15 @@ app.post('/api/admin/promo-codes', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Укажите, на сколько первых заказов действует промокод' });
   }
   const type = discountType === 'percent' ? 'percent' : 'fixed';
+  // Неизвестное значение схлопываем в once_global — это более узкое право
+  // (код сгорает после первого применения), поэтому ошибка в сторону
+  // безопасности, а не бесконечно применимого кода.
+  const usage = usageType === 'once_per_user' ? 'once_per_user' : 'once_global';
   const range = orderConditionToRange(orderCondition, orderConditionN);
   try {
     const result = await query(
-      `INSERT INTO promo_codes (code, discount_type, discount_value, min_order_total, expires_at, min_order_number, max_order_number)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      `INSERT INTO promo_codes (code, discount_type, discount_value, min_order_total, expires_at, min_order_number, max_order_number, usage_type)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
       [
         String(code).trim().toUpperCase(),
         type,
@@ -3055,6 +3147,7 @@ app.post('/api/admin/promo-codes', requireAuth, async (req, res) => {
         expiresAt || null,
         range.min,
         range.max,
+        usage,
       ]
     );
     res.status(201).json(toPromoDTO(result.rows[0]));
