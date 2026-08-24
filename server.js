@@ -501,6 +501,47 @@ function generateReferralCode() {
 // понять, новый ли это пользователь — а уведомление админу нужно ровно один
 // раз, а не при каждом заходе. Наружу флаг не отдаём: вызывающий код ждёт
 // строку пользователя ровно в том виде, в каком она лежит в таблице.
+// Проставляет новому пользователю источник привлечения и дату первого визита.
+//
+// Источник берём из start_attributions (payload диплинка, пойманный ботом на
+// /start), а дату первого визита — из analytics_events: users.created_at
+// фиксирует появление строки, то есть первый ЗАКАЗ или вход по телефону, а
+// это заметно позже, чем человек впервые открыл приложение.
+//
+// Молча ничего не делает, если сопоставить не с чем — у входа по телефону
+// telegram_id нет вовсе, и это нормальный случай, а не ошибка.
+async function attachAcquisition(user, telegramId) {
+  if (!telegramId) return;
+  try {
+    const attrRes = await query(
+      'SELECT utm_source, utm_campaign, utm_medium, referral_code FROM start_attributions WHERE telegram_id = $1',
+      [telegramId]
+    );
+    const attr = attrRes.rows[0] || {};
+    const firstSeenRes = await query(
+      'SELECT MIN(created_at) AS first_seen FROM analytics_events WHERE user_id = $1',
+      [telegramId]
+    );
+    const firstSeen = firstSeenRes.rows[0]?.first_seen || null;
+
+    // 'direct' — пришёл сам, без размеченной ссылки; это полноценный ответ
+    // на вопрос "откуда", а не отсутствие данных, поэтому пишем его явно.
+    const channel = attr.utm_source ? 'ad' : attr.referral_code ? 'referral' : 'direct';
+
+    await query(
+      `UPDATE users SET utm_source = $1, utm_campaign = $2, utm_medium = $3,
+                        acquisition_channel = $4, first_seen_at = $5
+       WHERE id = $6`,
+      [attr.utm_source || null, attr.utm_campaign || null, attr.utm_medium || null,
+       channel, firstSeen, user.id]
+    );
+  } catch (e) {
+    // Атрибуция — сопутствующая запись: её потеря не должна ломать
+    // регистрацию пользователя, ради которой всё и происходит.
+    console.error('attachAcquisition:', e);
+  }
+}
+
 async function upsertUser(telegramId, username, firstName) {
   for (let attempt = 0; attempt < 5; attempt++) {
     const code = generateReferralCode();
@@ -516,7 +557,13 @@ async function upsertUser(telegramId, username, firstName) {
         [telegramId, username || null, firstName || null, code]
       );
       const { is_new: isNew, ...user } = result.rows[0];
-      if (isNew) notifyNewUser(user, 'Telegram');
+      if (isNew) {
+        notifyNewUser(user, 'Telegram');
+        // Атрибуцию проставляем ровно один раз — при появлении строки.
+        // Позже её переписывать нельзя: человек привлечён однажды, и
+        // повторный заход по другой ссылке не меняет, откуда он пришёл.
+        await attachAcquisition(user, telegramId);
+      }
       return user;
     } catch (e) {
       if (e.code === '23505' && e.detail?.includes('referral_code')) continue;
@@ -1551,24 +1598,89 @@ app.post('/api/orders', resolveUser, async (req, res) => {
 // Аналитика поведения (публично — пишет фронт мини-приложения)
 // ============================================================
 
+// Разбор payload из диплинка (?start=… у бота, ?src=… в URL мини-аппа).
+//
+// Telegram жёстко ограничивает payload: до 64 символов из [A-Za-z0-9_-].
+// Поэтому сырые "utm_source=vk&utm_campaign=summer" туда не поместить ни
+// синтаксически, ни по длине — вместо них компактный позиционный формат.
+// Разделять механизмы префиксом, а не флагом, дёшево и расширяемо:
+//
+//   ref_<КОД>                              — реферальная программа
+//   u_<source>-<medium>-<campaign>-<...>   — рекламный источник
+//   что угодно ещё                         — молча игнорируем
+//
+// Дефис служит разделителем полей, поэтому внутри самих значений его быть
+// не может — собирающая сторона (лендинг) их зачищает. Пустое поле — это
+// пустая позиция: "u_vk--summer" = source vk, medium нет, campaign summer.
+//
+// Разбор живёт только здесь, на сервере: клиенту достаточно передать сырой
+// payload, и две копии формата не разъедутся.
+function parseStartPayload(payload) {
+  const empty = { utmSource: null, utmCampaign: null, utmMedium: null, referralCode: null };
+  if (!payload || typeof payload !== 'string') return empty;
+  const raw = payload.trim();
+  if (!raw) return empty;
+
+  const ref = /^ref_(.+)$/i.exec(raw);
+  if (ref) return { ...empty, referralCode: ref[1] };
+
+  const utm = /^u_(.*)$/i.exec(raw);
+  if (utm) {
+    const [source, medium, campaign] = utm[1].split('-');
+    return {
+      ...empty,
+      utmSource: source || null,
+      utmMedium: medium || null,
+      utmCampaign: campaign || null,
+    };
+  }
+  return empty;
+}
+
 // Принимает одно событие аналитики. Без авторизации (обычные пользователи),
 // но с базовой валидацией — sessionId и eventType обязательны, остальное
 // опционально. Фронт шлёт это fire-and-forget и игнорирует любой ответ,
 // поэтому ошибки здесь не должны ничего ронять — только логируются.
 app.post('/api/analytics/event', async (req, res) => {
-  const { sessionId, eventType, screenName, metadata, userId } = req.body || {};
+  const { sessionId, eventType, screenName, metadata, userId, startPayload } = req.body || {};
   if (!sessionId || typeof sessionId !== 'string' || !eventType || typeof eventType !== 'string') {
     return res.status(400).json({ error: 'Укажите sessionId и eventType' });
   }
   try {
+    // Атрибуция пишется только в app_opened — она свойство сессии, а не
+    // каждого её события (см. миграцию 050). Клиент присылает сырой payload,
+    // если он у него есть; если нет — поднимаем сохранённый ботом на /start,
+    // потому что до Mini App payload доходит не всегда (пользователь мог
+    // открыть приложение из меню, а не кнопкой под приветственным фото).
+    let utm = { utmSource: null, utmCampaign: null, utmMedium: null };
+    if (eventType === 'app_opened') {
+      const parsed = parseStartPayload(startPayload);
+      if (parsed.utmSource) {
+        utm = parsed;
+      } else if (!startPayload && userId) {
+        const saved = await query(
+          'SELECT utm_source, utm_campaign, utm_medium FROM start_attributions WHERE telegram_id = $1',
+          [userId]
+        );
+        const row = saved.rows[0];
+        if (row) {
+          utm = { utmSource: row.utm_source, utmCampaign: row.utm_campaign, utmMedium: row.utm_medium };
+        }
+      }
+    }
+
     await query(
-      'INSERT INTO analytics_events (user_id, session_id, event_type, screen_name, metadata) VALUES ($1, $2, $3, $4, $5)',
+      `INSERT INTO analytics_events (user_id, session_id, event_type, screen_name, metadata, utm_source, utm_campaign, utm_medium)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       [
         userId || null,
         sessionId,
         eventType,
         screenName || null,
         metadata ? JSON.stringify(metadata) : null,
+        utm.utmSource,
+        utm.utmCampaign,
+        utm.utmMedium,
       ]
     );
     res.status(201).json({ ok: true });
@@ -4168,24 +4280,87 @@ function parseAnalyticsRange(reqQuery) {
   return { from: from.toISOString(), to: to.toISOString() };
 }
 
-// Шаги воронки в порядке прохождения. 'home'..'cart' — screen_view по
-// экрану; 'checkout'/'order_placed' — отдельные event_type (в этом
-// приложении оформление — секция экрана "Корзина", а не отдельный роут).
-const FUNNEL_STEPS = [
-  { key: 'home', label: 'Главная' },
-  { key: 'catalog', label: 'Каталог' },
-  { key: 'product', label: 'Товар' },
-  { key: 'cart', label: 'Корзина' },
-  { key: 'checkout', label: 'Оформление' },
-  { key: 'order_placed', label: 'Заказ' },
+// Предикат для каждого целевого события воронки — единственное место, где
+// живёт соответствие "целевое имя → то, что реально лежит в базе".
+//
+// Часть событий пишется под историческими именами (checkout_start,
+// order_placed) — переименовывать их в базе значило бы порвать историю,
+// поэтому имена сведены к целевому списку здесь, алиасами.
+//
+// Товар и набор — одно и то же событие с разным metadata.category: у
+// наборов category = 'bundles'. Отдельных event_type для них нет
+// намеренно — иначе пришлось бы дублировать всю логику отправки ради
+// одного признака.
+const FUNNEL_EVENT_SQL = {
+  landing_viewed:      `event_type = 'landing_viewed'`,
+  app_opened:          `event_type = 'app_opened'`,
+  catalog_opened:      `event_type = 'screen_view' AND screen_name = 'catalog'`,
+  sets_opened:         `event_type = 'sets_opened'`,
+  product_opened:      `event_type = 'screen_view' AND screen_name = 'product' AND COALESCE(metadata->>'category', '') <> 'bundles'`,
+  set_opened:          `event_type = 'screen_view' AND screen_name = 'product' AND metadata->>'category' = 'bundles'`,
+  add_to_cart_product: `event_type = 'add_to_cart' AND COALESCE(metadata->>'category', '') <> 'bundles'`,
+  add_to_cart_set:     `event_type = 'add_to_cart' AND metadata->>'category' = 'bundles'`,
+  cart_opened:         `event_type = 'screen_view' AND screen_name = 'cart'`,
+  checkout_started:    `event_type = 'checkout_start'`,
+  address_started:     `event_type = 'address_started'`,
+  address_completed:   `event_type = 'address_completed'`,
+  payment_step_opened: `event_type = 'payment_step_opened'`,
+  order_created:       `event_type = 'order_placed'`,
+};
+
+// Воронка описана стадиями, а не плоским списком из 14 шагов, потому что
+// плоский список давал бы заведомо неверные проценты:
+//
+//   • landing_viewed живёт на другом домене (prilavka.shop) и в своей
+//     сессии — с app_opened по session_id он не связывается в принципе,
+//     поэтому вынесен в отдельный блок "до приложения" с грубым
+//     отношением вместо честного отвала (см. ниже preFunnel);
+//   • наборы — это ВЕТКА, а не ступень: сессия, ушедшая в наборы, не даёт
+//     product_opened, и линейный шаг показал бы фиктивный "отвал 100%".
+//     Поэтому у стадии может быть branches — они считаются параллельно и
+//     не участвуют в расчёте отвала;
+//   • address_* и payment_step_opened происходят ВНУТРИ оформления, между
+//     checkout_started и order_created — это под-воронка, а не стадии
+//     основной.
+const FUNNEL_STAGES = [
+  { key: 'app_opened', label: 'Открыли приложение' },
+  { key: 'catalog_opened', label: 'Каталог', branches: [{ key: 'sets_opened', label: 'Готовые наборы' }] },
+  { key: 'product_opened', label: 'Карточка товара', branches: [{ key: 'set_opened', label: 'Карточка набора' }] },
+  { key: 'add_to_cart_product', label: 'Товар в корзину', branches: [{ key: 'add_to_cart_set', label: 'Набор в корзину' }] },
+  { key: 'cart_opened', label: 'Корзина' },
+  { key: 'checkout_started', label: 'Начали оформление' },
+  { key: 'order_created', label: 'Заказ оформлен' },
 ];
 
-function funnelStepWhere(stepKey) {
-  switch (stepKey) {
-    case 'checkout': return `event_type = 'checkout_start'`;
-    case 'order_placed': return `event_type = 'order_placed'`;
-    default: return `event_type = 'screen_view' AND screen_name = '${stepKey}'`;
+// Под-воронка внутри оформления — от начала оформления до заказа.
+const CHECKOUT_SUBSTEPS = [
+  { key: 'checkout_started', label: 'Начали оформление' },
+  { key: 'address_started', label: 'Открыли адрес' },
+  { key: 'address_completed', label: 'Адрес сохранён' },
+  { key: 'payment_step_opened', label: 'Дошли до оплаты' },
+  { key: 'order_created', label: 'Заказ оформлен' },
+];
+
+// Фильтр по источнику трафика. Атрибуция лежит только в строке app_opened
+// (см. миграцию 050), поэтому фильтруем не событие, а СЕССИЮ: берём
+// session_id тех сессий, чей app_opened подходит под источник, и дальше
+// считаем по ним любые события. Без этого фильтр по utm_source отсекал бы
+// всё, кроме самих app_opened, и воронка схлопнулась бы в одну ступень.
+function attributionFilter(reqQuery, params) {
+  const conds = [];
+  if (reqQuery.utm_source) {
+    params.push(reqQuery.utm_source);
+    conds.push(`utm_source = $${params.length}`);
   }
+  if (reqQuery.utm_campaign) {
+    params.push(reqQuery.utm_campaign);
+    conds.push(`utm_campaign = $${params.length}`);
+  }
+  if (conds.length === 0) return '';
+  return ` AND session_id IN (
+    SELECT session_id FROM analytics_events
+    WHERE event_type = 'app_opened' AND ${conds.join(' AND ')}
+  )`;
 }
 
 // Воронка: для каждого шага — уникальные session_id за период (не строго
@@ -4194,24 +4369,64 @@ function funnelStepWhere(stepKey) {
 app.get('/api/admin/analytics/funnel', requireAuth, async (req, res) => {
   try {
     const { from, to } = parseAnalyticsRange(req.query);
-    const unionSql = FUNNEL_STEPS
-      .map((s) => `SELECT '${s.key}' AS step, COUNT(DISTINCT session_id)::int AS count
-        FROM analytics_events WHERE ${funnelStepWhere(s.key)} AND created_at >= $1 AND created_at < $2`)
-      .join(' UNION ALL ');
-    const result = await query(unionSql, [from, to]);
-    const countByStep = Object.fromEntries(result.rows.map((r) => [r.step, r.count]));
+    const params = [from, to];
+    const attrWhere = attributionFilter(req.query, params);
 
+    // Считаем все 14 целевых событий одним запросом — раскладываем по
+    // стадиям/веткам/под-шагам уже здесь, в JS.
+    const unionSql = Object.entries(FUNNEL_EVENT_SQL)
+      .map(([key, predicate]) => `SELECT '${key}' AS step, COUNT(DISTINCT session_id)::int AS count
+        FROM analytics_events
+        WHERE (${predicate}) AND created_at >= $1 AND created_at < $2${
+          // landing_viewed приходит с лендинга, где никакого app_opened и
+          // никакой атрибуции в нашем смысле нет — фильтр по источнику к
+          // нему неприменим, иначе он всегда обнулялся бы.
+          key === 'landing_viewed' ? '' : attrWhere
+        }`)
+      .join(' UNION ALL ');
+    const result = await query(unionSql, params);
+    const countOf = Object.fromEntries(result.rows.map((r) => [r.step, r.count]));
+
+    // Основная воронка: отвал считается только по магистрали, ветки идут
+    // рядом и в расчёт отвала не входят (см. комментарий у FUNNEL_STAGES).
     let prevCount = null;
-    const steps = FUNNEL_STEPS.map((s) => {
-      const count = countByStep[s.key] || 0;
+    const stages = FUNNEL_STAGES.map((s) => {
+      const count = countOf[s.key] || 0;
       const dropOffPct = prevCount == null
         ? null
         : prevCount === 0 ? 0 : Math.round((1 - count / prevCount) * 1000) / 10;
       prevCount = count;
+      return {
+        step: s.key,
+        label: s.label,
+        count,
+        dropOffPct,
+        branches: (s.branches || []).map((b) => ({ step: b.key, label: b.label, count: countOf[b.key] || 0 })),
+      };
+    });
+
+    let prevSub = null;
+    const checkoutSteps = CHECKOUT_SUBSTEPS.map((s) => {
+      const count = countOf[s.key] || 0;
+      const dropOffPct = prevSub == null
+        ? null
+        : prevSub === 0 ? 0 : Math.round((1 - count / prevSub) * 1000) / 10;
+      prevSub = count;
       return { step: s.key, label: s.label, count, dropOffPct };
     });
 
-    res.json({ from, to, steps });
+    // Лендинг и мини-апп — разные origin и разные сессии, связать их по
+    // session_id нельзя. Поэтому не ступень воронки, а отдельный блок с
+    // честно названным грубым отношением.
+    const landingViews = countOf.landing_viewed || 0;
+    const appOpens = countOf.app_opened || 0;
+    const preFunnel = {
+      landingViews,
+      appOpens,
+      ratioPct: landingViews ? Math.round((appOpens / landingViews) * 1000) / 10 : null,
+    };
+
+    res.json({ from, to, stages, checkoutSteps, preFunnel });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
@@ -4244,6 +4459,7 @@ app.get('/api/admin/analytics/sessions', requireAuth, async (req, res) => {
       params.push(req.query.user_id);
       userFilter = `AND user_id = $${params.length}`;
     }
+    const attrWhere = attributionFilter(req.query, params);
     const result = await query(
       `WITH sess AS (
          SELECT
@@ -4251,19 +4467,26 @@ app.get('/api/admin/analytics/sessions', requireAuth, async (req, res) => {
            MAX(user_id) AS user_id,
            MIN(created_at) AS started_at,
            COUNT(*)::int AS event_count,
+           -- Атрибуция лежит только в строке app_opened, в остальных NULL,
+           -- поэтому MAX по сессии и достаёт ровно её (см. миграцию 050).
+           MAX(utm_source) AS utm_source,
+           MAX(utm_campaign) AS utm_campaign,
            MAX(
              CASE
-               WHEN event_type = 'order_placed' THEN 6
-               WHEN event_type = 'checkout_start' THEN 5
-               WHEN event_type = 'screen_view' AND screen_name = 'cart' THEN 4
+               WHEN event_type = 'order_placed' THEN 7
+               WHEN event_type = 'checkout_start' THEN 6
+               WHEN event_type = 'screen_view' AND screen_name = 'cart' THEN 5
+               WHEN event_type = 'add_to_cart' THEN 4
                WHEN event_type = 'screen_view' AND screen_name = 'product' THEN 3
                WHEN event_type = 'screen_view' AND screen_name = 'catalog' THEN 2
+               WHEN event_type = 'sets_opened' THEN 2
+               WHEN event_type = 'app_opened' THEN 1
                WHEN event_type = 'screen_view' AND screen_name = 'home' THEN 1
                ELSE 0
              END
            ) AS final_step_rank
          FROM analytics_events
-         WHERE created_at >= $1 AND created_at < $2 ${userFilter}
+         WHERE created_at >= $1 AND created_at < $2 ${userFilter}${attrWhere}
          GROUP BY session_id
        )
        SELECT sess.*, u.first_name, u.username, u.phone
@@ -4273,7 +4496,7 @@ app.get('/api/admin/analytics/sessions', requireAuth, async (req, res) => {
        LIMIT 200`,
       params
     );
-    const STEP_BY_RANK = ['other', 'home', 'catalog', 'product', 'cart', 'checkout', 'order_placed'];
+    const STEP_BY_RANK = ['other', 'app_opened', 'catalog_opened', 'product_opened', 'add_to_cart', 'cart_opened', 'checkout_started', 'order_created'];
     res.json(result.rows.map((r) => ({
       sessionId: r.session_id,
       userId: r.user_id,
@@ -4281,6 +4504,33 @@ app.get('/api/admin/analytics/sessions', requireAuth, async (req, res) => {
       startedAt: r.started_at,
       eventCount: r.event_count,
       finalStep: STEP_BY_RANK[r.final_step_rank] || 'other',
+      utmSource: r.utm_source,
+      utmCampaign: r.utm_campaign,
+    })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Какие источники вообще встречались за период — чтобы в админке выбирать
+// из реального списка, а не вспоминать, как именно была размечена ссылка.
+app.get('/api/admin/analytics/sources', requireAuth, async (req, res) => {
+  try {
+    const { from, to } = parseAnalyticsRange(req.query);
+    const result = await query(
+      `SELECT utm_source, utm_campaign, COUNT(DISTINCT session_id)::int AS sessions
+       FROM analytics_events
+       WHERE event_type = 'app_opened' AND utm_source IS NOT NULL
+         AND created_at >= $1 AND created_at < $2
+       GROUP BY utm_source, utm_campaign
+       ORDER BY sessions DESC`,
+      [from, to]
+    );
+    res.json(result.rows.map((r) => ({
+      utmSource: r.utm_source,
+      utmCampaign: r.utm_campaign,
+      sessions: r.sessions,
     })));
   } catch (e) {
     console.error(e);
@@ -4608,8 +4858,44 @@ app.post('/telegram-webhook', async (req, res) => {
   const msg = req.body?.message;
   if (!msg?.text) return;
 
-  // /start (в том числе с реферальным диплинком "/start ref_XXXXX")
+  // /start (в том числе с диплинком "/start ref_XXXXX" или "/start u_vk-cpc-summer")
   if (msg.text === '/start' || msg.text.startsWith('/start ')) {
+    // Payload доходит СЮДА и больше никуда: initDataUnsafe.start_param
+    // заполняется только при открытии по прямой ссылке Mini App
+    // (t.me/бот/приложение?startapp=…), а этот бот открывает приложение
+    // инлайн-кнопкой web_app. До сих пор payload здесь молча терялся —
+    // из-за чего реферальные ссылки ?start=ref_КОД фактически не работали.
+    // Поэтому: сохраняем его на будущее и пробрасываем в URL кнопки, откуда
+    // мини-апп прочитает его обычным location.search.
+    const payload = msg.text.startsWith('/start ') ? msg.text.slice('/start '.length).trim() : '';
+    const telegramId = msg.from?.id;
+
+    if (payload && telegramId) {
+      const parsed = parseStartPayload(payload);
+      try {
+        await query(
+          `INSERT INTO start_attributions (telegram_id, payload, utm_source, utm_campaign, utm_medium, referral_code)
+           VALUES ($1,$2,$3,$4,$5,$6)
+           ON CONFLICT (telegram_id) DO UPDATE SET
+             payload = EXCLUDED.payload,
+             utm_source = EXCLUDED.utm_source,
+             utm_campaign = EXCLUDED.utm_campaign,
+             utm_medium = EXCLUDED.utm_medium,
+             referral_code = EXCLUDED.referral_code,
+             created_at = now()`,
+          [telegramId, payload, parsed.utmSource, parsed.utmCampaign, parsed.utmMedium, parsed.referralCode]
+        );
+      } catch (e) {
+        // Атрибуция не должна мешать человеку начать пользоваться ботом —
+        // приветствие ниже отправляется в любом случае.
+        console.error('start_attributions:', e);
+      }
+    }
+
+    const webAppUrl = payload
+      ? `${MINI_APP_URL}?src=${encodeURIComponent(payload)}`
+      : MINI_APP_URL;
+
     await botRequestMultipart('sendPhoto', {
       file: { buffer: START_PHOTO_BUFFER, filename: 'start-photo.png' },
       fileField: 'photo',
@@ -4618,7 +4904,7 @@ app.post('/telegram-webhook', async (req, res) => {
       parse_mode: 'HTML',
       reply_markup: {
         inline_keyboard: [[
-          { text: 'Прилавка', web_app: { url: MINI_APP_URL } },
+          { text: 'Прилавка', web_app: { url: webAppUrl } },
         ]],
       },
     });
