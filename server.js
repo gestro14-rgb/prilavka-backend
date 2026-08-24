@@ -128,6 +128,14 @@ function toProductDTO(row) {
     // значение = набор участвует в hero-карусели — отдельного флага/списка
     // нет, см. heroSets в Home.jsx.
     homeVideoUrl: row.home_video_url || null,
+    // Короткая ситуативная подпись для витринных карточек наборов (задача
+    // 10 воронки, migrations/051) — НЕ замена title: тот остаётся точным и
+    // используется в чеке заказа, поиске каталога, истории "Уже заказывали".
+    // Пусто → фронт сам берёт title/weight, как раньше (см. cardEmoji/
+    // cardTitle/cardSubtitle в HeroSetCard.jsx и Home.jsx).
+    cardEmoji: row.card_emoji || null,
+    cardTitle: row.card_title || null,
+    cardSubtitle: row.card_subtitle || null,
     isBundle: row.is_bundle ?? false,
     subcategoryId: row.subcategory_id ?? null,
     nutrition: row.nutrition ?? null,
@@ -2484,8 +2492,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
       : null;
     await query(
       `INSERT INTO products
-        (id, slug, title, price, old_price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg, individual_margin_percent, price_per_kg, home_video_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)`,
+        (id, slug, title, price, old_price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg, individual_margin_percent, price_per_kg, home_video_url, card_emoji, card_title, card_subtitle)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)`,
       [
         p.id,
         p.slug || p.id,
@@ -2516,6 +2524,9 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
         individualMargin,
         pricePerKg,
         p.homeVideoUrl || null,
+        p.cardEmoji || null,
+        p.cardTitle || null,
+        p.cardSubtitle || null,
       ]
     );
     const result = await query('SELECT * FROM products WHERE id = $1', [p.id]);
@@ -2590,8 +2601,11 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         old_price = $26,
         price_per_kg = $27,
         home_video_url = $28,
+        card_emoji = $29,
+        card_title = $30,
+        card_subtitle = $31,
         updated_at = now()
-       WHERE id = $29`,
+       WHERE id = $32`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -2625,6 +2639,9 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         p.oldPrice !== undefined ? (p.oldPrice !== '' && p.oldPrice != null ? p.oldPrice : null) : cur.old_price,
         pricePerKg,
         p.homeVideoUrl !== undefined ? (p.homeVideoUrl || null) : (cur.home_video_url || null),
+        p.cardEmoji !== undefined ? (p.cardEmoji || null) : (cur.card_emoji || null),
+        p.cardTitle !== undefined ? (p.cardTitle || null) : (cur.card_title || null),
+        p.cardSubtitle !== undefined ? (p.cardSubtitle || null) : (cur.card_subtitle || null),
         req.params.id,
       ]
     );
