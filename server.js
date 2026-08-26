@@ -136,6 +136,16 @@ function toProductDTO(row) {
     cardEmoji: row.card_emoji || null,
     cardTitle: row.card_title || null,
     cardSubtitle: row.card_subtitle || null,
+    // Цветная плашка-тег для секции «Сегодня особенно хорошее» на Главной
+    // (migrations/052) — про вкус/текстуру самого продукта, отдельно от
+    // badge выше (тот про статус в ассортименте: Хит / Выгодно / Чаще
+    // берут). Непустой tagLabel = товар участвует в секции, отдельного
+    // флага нет — см. specialProducts в Home.jsx. tagColor — имя пресета
+    // ('green'|'orange'|'ochre'|'berry'), не hex: разворачивает его фронт,
+    // чтобы произвольные цвета из админки не размывали палитру, как это
+    // вышло с badge_color (см. Badge.jsx).
+    tagLabel: row.tag_label || null,
+    tagColor: row.tag_color || null,
     isBundle: row.is_bundle ?? false,
     subcategoryId: row.subcategory_id ?? null,
     nutrition: row.nutrition ?? null,
@@ -1013,6 +1023,9 @@ app.get('/api/catalog', resolveUserOptional, async (req, res) => {
       homeContent: {
         seasonalTitle: getSetting('home_seasonal_title') || 'Сейчас в сезоне',
         seasonalSubtitle: getSetting('home_seasonal_subtitle') || '',
+        // Заголовок «Сегодня особенно хорошее 🍓» (migrations/052) — тем же
+        // механизмом, что и «Сейчас в сезоне» выше.
+        specialTitle: getSetting('home_special_title') || 'Сегодня особенно хорошее 🍓',
       },
       storyCards: storyCardsRes.rows.map(toStoryCardDTO),
     });
@@ -2492,8 +2505,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
       : null;
     await query(
       `INSERT INTO products
-        (id, slug, title, price, old_price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg, individual_margin_percent, price_per_kg, home_video_url, card_emoji, card_title, card_subtitle)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)`,
+        (id, slug, title, price, old_price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg, individual_margin_percent, price_per_kg, home_video_url, card_emoji, card_title, card_subtitle, tag_label, tag_color)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)`,
       [
         p.id,
         p.slug || p.id,
@@ -2527,6 +2540,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
         p.cardEmoji || null,
         p.cardTitle || null,
         p.cardSubtitle || null,
+        p.tagLabel || null,
+        p.tagColor || null,
       ]
     );
     const result = await query('SELECT * FROM products WHERE id = $1', [p.id]);
@@ -2604,8 +2619,10 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         card_emoji = $29,
         card_title = $30,
         card_subtitle = $31,
+        tag_label = $32,
+        tag_color = $33,
         updated_at = now()
-       WHERE id = $32`,
+       WHERE id = $34`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -2642,6 +2659,8 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         p.cardEmoji !== undefined ? (p.cardEmoji || null) : (cur.card_emoji || null),
         p.cardTitle !== undefined ? (p.cardTitle || null) : (cur.card_title || null),
         p.cardSubtitle !== undefined ? (p.cardSubtitle || null) : (cur.card_subtitle || null),
+        p.tagLabel !== undefined ? (p.tagLabel || null) : (cur.tag_label || null),
+        p.tagColor !== undefined ? (p.tagColor || null) : (cur.tag_color || null),
         req.params.id,
       ]
     );
