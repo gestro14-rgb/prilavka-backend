@@ -146,6 +146,12 @@ function toProductDTO(row) {
     // вышло с badge_color (см. Badge.jsx).
     tagLabel: row.tag_label || null,
     tagColor: row.tag_color || null,
+    // «На скольких человек» и «на какой срок» набора (migrations/053) —
+    // две строки рядом с весом на hero-карточке Главной. Пусто → фронт
+    // пробует достать фразу из названия регуляркой, как делал до появления
+    // этих полей (setPeopleLabel/setTermLabel в format.js).
+    audienceLabel: row.audience_label || null,
+    termLabel: row.term_label || null,
     isBundle: row.is_bundle ?? false,
     subcategoryId: row.subcategory_id ?? null,
     nutrition: row.nutrition ?? null,
@@ -2505,8 +2511,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
       : null;
     await query(
       `INSERT INTO products
-        (id, slug, title, price, old_price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg, individual_margin_percent, price_per_kg, home_video_url, card_emoji, card_title, card_subtitle, tag_label, tag_color)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)`,
+        (id, slug, title, price, old_price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg, individual_margin_percent, price_per_kg, home_video_url, card_emoji, card_title, card_subtitle, tag_label, tag_color, audience_label, term_label)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36)`,
       [
         p.id,
         p.slug || p.id,
@@ -2542,6 +2548,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
         p.cardSubtitle || null,
         p.tagLabel || null,
         p.tagColor || null,
+        p.audienceLabel || null,
+        p.termLabel || null,
       ]
     );
     const result = await query('SELECT * FROM products WHERE id = $1', [p.id]);
@@ -2621,8 +2629,10 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         card_subtitle = $31,
         tag_label = $32,
         tag_color = $33,
+        audience_label = $34,
+        term_label = $35,
         updated_at = now()
-       WHERE id = $34`,
+       WHERE id = $36`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -2661,6 +2671,8 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         p.cardSubtitle !== undefined ? (p.cardSubtitle || null) : (cur.card_subtitle || null),
         p.tagLabel !== undefined ? (p.tagLabel || null) : (cur.tag_label || null),
         p.tagColor !== undefined ? (p.tagColor || null) : (cur.tag_color || null),
+        p.audienceLabel !== undefined ? (p.audienceLabel || null) : (cur.audience_label || null),
+        p.termLabel !== undefined ? (p.termLabel || null) : (cur.term_label || null),
         req.params.id,
       ]
     );
