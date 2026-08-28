@@ -4891,7 +4891,7 @@ const START_MESSAGE = `<b>Привет! 👋 Я Михаил.
 // каждый /start: статичный файл, лишний disk I/O на каждое сообщение не
 // нужен, а падать (если файла нет) лучше сразу при запуске, а не молча
 // на первом реальном /start.
-const START_PHOTO_PATH = fileURLToPath(new URL('./assets/IMG_8571.PNG', import.meta.url));
+const START_PHOTO_PATH = fileURLToPath(new URL('./assets/start-welcome.png', import.meta.url));
 const START_PHOTO_BUFFER = fs.readFileSync(START_PHOTO_PATH);
 
 // Принимает апдейты от Telegram (сейчас только текстовые сообщения — см.
