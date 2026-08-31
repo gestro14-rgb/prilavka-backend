@@ -1040,6 +1040,14 @@ app.get('/api/catalog', resolveUserOptional, async (req, res) => {
         specialTitle: getSetting('home_special_title') || 'Сегодня особенно хорошее 🍓',
       },
       storyCards: storyCardsRes.rows.map(toStoryCardDTO),
+      // Настройки, которые нужны витрине. Минимальная сумма заказа до сих
+      // пор жила только на сервере (проверка при POST /api/orders) и
+      // дублировалась константой в коде приложения: поменяв её в админке,
+      // мы получили бы приложение, считающее по-старому, и отказ уже после
+      // нажатия «Оформить». Теперь число одно и приходит отсюда.
+      settings: {
+        minOrderTotal: Number(getSetting('min_order_total')) || 1990,
+      },
     });
   } catch (e) {
     console.error(e);
