@@ -85,6 +85,35 @@ function getSetting(key) {
 }
 
 // ============================================================
+// Видимость витрин Главной (migrations/056)
+// ============================================================
+//
+// Ключи витрин — те же, что у home_product_shelves и у вкладок админки, и
+// это не совпадение: витрина и её видимость описывают один и тот же блок с
+// разных сторон. Состав живёт в home_product_shelves, видимость — строкой в
+// settings, потому что это ровно настройка: один флаг на блок, читается
+// вместе с остальными настройками Главной, правится той же ручкой
+// PUT /api/admin/settings/:key.
+//
+// Отдельной таблицы не завели сознательно: под пять булевых значений она
+// добавила бы join к каждому запросу каталога и второй механизм там, где
+// уже есть подходящий.
+const HOME_SECTION_KEYS = ['bundles', 'special', 'seasonal', 'hits'];
+
+const homeSectionSettingKey = (section) => `home_section_${section}_visible`;
+
+// Отсутствие настройки — это «показывать». Так ведёт себя и прод до
+// применения миграции, и любой блок, который добавят позже: Главная не
+// должна пропадать из-за незаполненного флага.
+function isHomeSectionVisible(section) {
+  return getSetting(homeSectionSettingKey(section)) !== 'false';
+}
+
+function homeSectionsVisibility() {
+  return Object.fromEntries(HOME_SECTION_KEYS.map((s) => [s, isHomeSectionVisible(s)]));
+}
+
+// ============================================================
 // Вспомогательные функции
 // ============================================================
 
@@ -1067,6 +1096,11 @@ app.get('/api/catalog', resolveUserOptional, async (req, res) => {
         // механизмом, что и «Сейчас в сезоне» выше.
         specialTitle: getSetting('home_special_title') || 'Сегодня особенно хорошее 🍓',
       },
+      // Видимость витрин Главной (migrations/056) — отдельная от их состава
+      // сущность: выключенный блок не отдаётся фронту, но его строки в
+      // home_product_shelves остаются нетронутыми, и включение возвращает
+      // тот же список в том же порядке.
+      homeSections: homeSectionsVisibility(),
       storyCards: storyCardsRes.rows.map(toStoryCardDTO),
     });
   } catch (e) {
