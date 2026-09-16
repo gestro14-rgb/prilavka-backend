@@ -117,6 +117,41 @@ function homeSectionsVisibility() {
 // Вспомогательные функции
 // ============================================================
 
+// Бейдж из библиотеки (migrations/057). Наружу — то, что нужно нарисовать
+// плашку, и sortOrder, по которому карточка выбирает первый из нескольких.
+// is_active в DTO не уходит: выключенные бейджи до витрины не доезжают
+// вовсе, фронту нечего с этим флагом делать.
+function toBadgeDTO(row) {
+  return {
+    id: row.id,
+    label: row.label,
+    // Пустая строка из формы и NULL из базы — одно и то же: «без иконки».
+    // Нормализуем здесь, чтобы фронт проверял одно условие, а не два.
+    icon: row.icon || null,
+    bgColor: row.bg_color,
+    textColor: row.text_color,
+    // pb_sort — порядок внутри товара, b_sort — порядок в библиотеке.
+    // Наружу отдаём первый, где он есть: он и определяет, какой бейдж
+    // покажет карточка с местом на один.
+    sortOrder: row.pb_sort != null ? row.pb_sort : row.sort_order,
+  };
+}
+
+// Тот же бейдж для админки: плюс флаг активности и, где посчитано, число
+// товаров с этим бейджем. Публичному DTO ни то ни другое не нужно.
+function toAdminBadgeDTO(row) {
+  return {
+    id: row.id,
+    label: row.label,
+    icon: row.icon || null,
+    bgColor: row.bg_color,
+    textColor: row.text_color,
+    sortOrder: row.sort_order,
+    isActive: row.is_active,
+    productCount: row.product_count != null ? row.product_count : undefined,
+  };
+}
+
 function toProductDTO(row) {
   return {
     id: row.id,
@@ -1010,6 +1045,29 @@ app.get('/api/catalog', resolveUserOptional, async (req, res) => {
       ratingByProduct[row.product_id] = { avgStars: Math.round(row.avg_stars * 10) / 10, count: row.count };
     }
 
+    // Бейджи товаров (migrations/057). Одним запросом на весь каталог и
+    // раскладкой по product_id — по запросу на товар это были бы сотни
+    // обращений. Отдельно от Promise.all выше и в try/catch: пока
+    // миграция не применена, таблиц нет, и падать из-за этого весь каталог
+    // не должен — товары просто приезжают без новых бейджей, со старым
+    // полем badge, как и раньше.
+    const badgesByProduct = {};
+    try {
+      const productBadgesRes = await query(
+        `SELECT pb.product_id, b.id, b.label, b.icon, b.bg_color, b.text_color, pb.sort_order AS pb_sort, b.sort_order AS b_sort
+           FROM product_badges pb
+           JOIN badges b ON b.id = pb.badge_id
+          WHERE b.is_active = true
+          ORDER BY pb.product_id, pb.sort_order ASC, b.sort_order ASC, b.id ASC`
+      );
+      for (const row of productBadgesRes.rows) {
+        if (!badgesByProduct[row.product_id]) badgesByProduct[row.product_id] = [];
+        badgesByProduct[row.product_id].push(toBadgeDTO(row));
+      }
+    } catch (e) {
+      console.error('badges load skipped:', e.message);
+    }
+
     const homeShelves = {};
     for (const row of homeShelvesRes.rows) {
       if (!homeShelves[row.shelf]) homeShelves[row.shelf] = [];
@@ -1059,6 +1117,12 @@ app.get('/api/catalog', resolveUserOptional, async (req, res) => {
           ...dto,
           bundleComposition: compositionsByProduct[row.id] ?? null,
           rating: ratingByProduct[row.id] ?? null,
+          // Бейджи из библиотеки (migrations/057) — отдельным полем рядом
+          // со старым badge, а не вместо него: старый продолжает работать
+          // у всех товаров, которым его когда-то проставили, и участвует в
+          // подборе «Хитов недели». Пустой массив — «новых бейджей нет»,
+          // карточка тогда рисует старый.
+          badges: badgesByProduct[row.id] ?? [],
         };
       }),
       reviews: reviewsRes.rows.map((row) => toReviewDTO(row, votedReviewIds)),
@@ -3562,6 +3626,190 @@ app.delete('/api/admin/deliveries/:id', requireAuth, async (req, res) => {
 });
 
 // ============================================================
+// Админские маршруты — библиотека бейджей (migrations/057)
+// ============================================================
+//
+// Бейдж — визуальная плашка на карточке товара и ничего больше. К подбору
+// «Хитов недели», витринам Главной, тегам и фильтрам он отношения не имеет:
+// за это отвечают badge_type и tag_label, которые живут в products и этой
+// ручкой не затрагиваются.
+
+// Цвет принимаем только как #RGB или #RRGGBB. Сузили намеренно: значение
+// уходит прямо в inline-style карточки, и пускать туда произвольную строку
+// нельзя. Прозрачности нет — плашка лежит поверх фотографии, и
+// полупрозрачный фон сделал бы текст нечитаемым на половине снимков.
+const HEX_COLOR_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+
+// Эмодзи: одно-два, не больше. Поле текстовое, и без ограничения туда
+// уедет строка любой длины, которая разорвёт плашку на карточке.
+const BADGE_ICON_MAX = 8;
+const BADGE_LABEL_MAX = 40;
+
+function validateBadgePayload(p, { partial = false } = {}) {
+  const has = (k) => p[k] !== undefined;
+
+  if (!partial || has('label')) {
+    const label = String(p.label ?? '').trim();
+    if (!label) return 'Укажите текст бейджа';
+    if (label.length > BADGE_LABEL_MAX) return `Текст бейджа — не длиннее ${BADGE_LABEL_MAX} символов`;
+  }
+  for (const key of ['bgColor', 'textColor']) {
+    if (!partial || has(key)) {
+      const v = String(p[key] ?? '').trim();
+      if (!HEX_COLOR_RE.test(v)) return 'Цвета задаются в формате #RGB или #RRGGBB';
+    }
+  }
+  if (has('icon') && p.icon != null && String(p.icon).trim().length > BADGE_ICON_MAX) {
+    return 'Иконка — один-два эмодзи';
+  }
+  return null;
+}
+
+// Список бейджей с числом товаров, у которых он назначен: админке это
+// число нужно и в карточке бейджа, и в подтверждении удаления. LEFT JOIN,
+// а не отдельный запрос на строку — иначе на каждый бейдж свой count.
+app.get('/api/admin/badges', requireAuth, async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT b.*, COUNT(pb.product_id)::int AS product_count
+         FROM badges b
+         LEFT JOIN product_badges pb ON pb.badge_id = b.id
+        GROUP BY b.id
+        ORDER BY b.sort_order ASC, b.id ASC`
+    );
+    res.json(result.rows.map(toAdminBadgeDTO));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.post('/api/admin/badges', requireAuth, async (req, res) => {
+  const p = req.body || {};
+  const invalid = validateBadgePayload(p);
+  if (invalid) return res.status(400).json({ error: invalid });
+  try {
+    const result = await query(
+      `INSERT INTO badges (label, icon, bg_color, text_color, sort_order, is_active)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [
+        String(p.label).trim(),
+        p.icon != null && String(p.icon).trim() !== '' ? String(p.icon).trim() : null,
+        String(p.bgColor).trim(),
+        String(p.textColor).trim(),
+        Number(p.sortOrder) || 0,
+        p.isActive !== false,
+      ]
+    );
+    res.status(201).json(toAdminBadgeDTO({ ...result.rows[0], product_count: 0 }));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Частичное обновление: присланные поля меняем, остальные оставляем как
+// есть. Так одна и та же ручка обслуживает и форму редактирования, и
+// переключатель «активен» в списке, которому незачем слать всю запись.
+app.put('/api/admin/badges/:id', requireAuth, async (req, res) => {
+  const p = req.body || {};
+  const invalid = validateBadgePayload(p, { partial: true });
+  if (invalid) return res.status(400).json({ error: invalid });
+  try {
+    const cur = await query('SELECT * FROM badges WHERE id = $1', [req.params.id]);
+    if (!cur.rows[0]) return res.status(404).json({ error: 'Бейдж не найден' });
+    const c = cur.rows[0];
+    const result = await query(
+      `UPDATE badges SET label = $1, icon = $2, bg_color = $3, text_color = $4, sort_order = $5, is_active = $6
+       WHERE id = $7 RETURNING *`,
+      [
+        p.label !== undefined ? String(p.label).trim() : c.label,
+        p.icon !== undefined ? (String(p.icon).trim() || null) : c.icon,
+        p.bgColor !== undefined ? String(p.bgColor).trim() : c.bg_color,
+        p.textColor !== undefined ? String(p.textColor).trim() : c.text_color,
+        p.sortOrder !== undefined ? (Number(p.sortOrder) || 0) : c.sort_order,
+        p.isActive !== undefined ? p.isActive === true : c.is_active,
+        req.params.id,
+      ]
+    );
+    const count = await query('SELECT COUNT(*)::int AS n FROM product_badges WHERE badge_id = $1', [req.params.id]);
+    res.json(toAdminBadgeDTO({ ...result.rows[0], product_count: count.rows[0].n }));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Удаление. Привязки уходят каскадом (см. миграцию), товары остаются, их
+// старые badge_type/badge_label/badge_color не трогаются вовсе. Число
+// затронутых товаров возвращаем, чтобы админка могла показать его в
+// подтверждении — считаем ДО удаления, после него считать уже нечего.
+app.delete('/api/admin/badges/:id', requireAuth, async (req, res) => {
+  try {
+    const count = await query('SELECT COUNT(*)::int AS n FROM product_badges WHERE badge_id = $1', [req.params.id]);
+    const result = await query('DELETE FROM badges WHERE id = $1 RETURNING id', [req.params.id]);
+    if (!result.rows[0]) return res.status(404).json({ error: 'Бейдж не найден' });
+    res.json({ ok: true, unlinkedProducts: count.rows[0].n });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ── Бейджи конкретного товара ───────────────────────────────────────────
+//
+// Назначение — одной ручкой на весь список, а не по бейджу за запрос.
+// Форма товара редактирует состав и порядок целиком и сохраняется одной
+// кнопкой; добавление/удаление/перестановка по отдельным запросам
+// означали бы, что при обрыве связи у товара останется половина правки.
+app.get('/api/admin/products/:id/badges', requireAuth, async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT b.*, pb.sort_order AS pb_sort
+         FROM product_badges pb
+         JOIN badges b ON b.id = pb.badge_id
+        WHERE pb.product_id = $1
+        ORDER BY pb.sort_order ASC, b.id ASC`,
+      [req.params.id]
+    );
+    res.json(result.rows.map((r) => ({ ...toAdminBadgeDTO(r), sortOrder: r.pb_sort })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Полная замена набора бейджей товара. Порядок берём из позиции в массиве —
+// админке не нужно вести отдельное поле, она просто присылает список в том
+// виде, в каком его выстроил человек.
+app.put('/api/admin/products/:id/badges', requireAuth, async (req, res) => {
+  const ids = Array.isArray(req.body?.badgeIds) ? req.body.badgeIds : null;
+  if (!ids) return res.status(400).json({ error: 'Ожидается badgeIds: массив id' });
+  try {
+    const product = await query('SELECT id FROM products WHERE id = $1', [req.params.id]);
+    if (!product.rows[0]) return res.status(404).json({ error: 'Товар не найден' });
+
+    await query('DELETE FROM product_badges WHERE product_id = $1', [req.params.id]);
+    // Дубли в присланном списке схлопываем: первичный ключ (product_id,
+    // badge_id) их всё равно не пропустит, а порядок берём по первому
+    // вхождению.
+    const unique = [...new Set(ids.map((v) => Number(v)).filter((v) => Number.isInteger(v)))];
+    for (let i = 0; i < unique.length; i += 1) {
+      await query(
+        'INSERT INTO product_badges (product_id, badge_id, sort_order) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING',
+        [req.params.id, unique[i], i]
+      );
+    }
+    res.json({ ok: true, badgeIds: unique });
+  } catch (e) {
+    console.error(e);
+    // Несуществующий badge_id — нарушение внешнего ключа, а не наша
+    // внутренняя ошибка: говорим об этом честно.
+    if (e.code === '23503') return res.status(400).json({ error: 'Одного из бейджей больше нет — обновите страницу' });
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+// ============================================================
 // Админские маршруты — витрины Главной (ручные подборки товаров)
 // ============================================================
 
@@ -5191,6 +5439,25 @@ app.put('/api/admin/pricing-settings', requireAuth, async (req, res) => {
 // ============================================================
 
 loadSettings().catch((e) => console.error('loadSettings error:', e));
+
+// Периодическое обновление кэша настроек.
+//
+// Кэш write-through: ручка PUT /api/admin/settings/:key правит и базу, и
+// settingsCache, поэтому изменения из админки видны сразу — на одном
+// инстансе (сейчас он один, numReplicas не задан) этого достаточно.
+// Дыра в другом: любая запись МИМО процесса — миграция, ручной UPDATE,
+// второй инстанс, если его когда-нибудь включат — в кэш не попадает
+// никогда, и процесс живёт со старым значением до перезапуска. Ровно так
+// вели себя ключи видимости сразу после миграции 056.
+//
+// 30 секунд — компромисс: один запрос на десяток строк, задержка
+// незаметна для админки (та и так видит своё изменение мгновенно через
+// write-through) и ограничена для всех остальных источников.
+// unref, чтобы таймер не держал процесс при остановке.
+const SETTINGS_REFRESH_MS = 30_000;
+setInterval(() => {
+  loadSettings().catch((e) => console.error('settings refresh error:', e.message));
+}, SETTINGS_REFRESH_MS).unref();
 registerWebhook().catch((e) => console.error('registerWebhook error:', e));
 
 app.listen(PORT, () => {
