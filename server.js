@@ -4641,6 +4641,55 @@ app.get('/api/admin/stats', requireAuth, async (req, res) => {
 
 // from/to — 'YYYY-MM-DD'. По умолчанию — последние 7 дней. `to` включает
 // весь указанный день (до 23:59:59.999).
+// ============================================================
+// Исключение из аналитики (migrations/058)
+// ============================================================
+//
+// Список исключённых держим в памяти и обновляем по тому же принципу, что
+// settingsCache: он читается в КАЖДОМ аналитическом запросе, а меняется
+// раз в месяц. Запрос за списком на каждый чих — лишний round-trip к базе
+// ради двух чисел.
+//
+// Пустой массив — валидное состояние: значит, исключать некого, и фильтр
+// не подмешивается в SQL вовсе.
+let analyticsExcludedIds = [];
+
+async function loadAnalyticsExclusions() {
+  try {
+    const r = await query('SELECT telegram_id FROM analytics_excluded_users WHERE is_active = true');
+    analyticsExcludedIds = r.rows.map((x) => Number(x.telegram_id)).filter(Number.isFinite);
+  } catch (e) {
+    // Таблицы ещё нет (миграция не применена) — работаем без исключений,
+    // как работали раньше. Ронять всю аналитику из-за этого нельзя.
+    console.error('analytics exclusions load skipped:', e.message);
+    analyticsExcludedIds = [];
+  }
+}
+
+/**
+ * Кусок SQL, отбрасывающий сессии исключённых пользователей.
+ *
+ * Фильтруем по СЕССИИ, а не по user_id самого события, и это принципиально:
+ * мини-апп присылает user_id не в каждом событии (часть экранов
+ * отправляется до того, как Telegram отдал initData). Отбрасывая только
+ * опознанные события, мы бы оставили половину следа владельца в воронке.
+ * Сессия целиком принадлежит одному человеку, поэтому правило простое:
+ * есть в сессии хоть одно событие исключённого — сессии нет.
+ *
+ * Идентификаторы подставляются прямо в строку, а не параметрами: это
+ * числа, прошедшие Number.isFinite, и их количество меняется от вызова к
+ * вызову — нумерованные плейсхолдеры пришлось бы согласовывать с
+ * params каждого запроса.
+ *
+ * alias — имя таблицы событий в запросе, куда подмешиваем условие.
+ */
+function analyticsExclusionSql(alias = '') {
+  if (analyticsExcludedIds.length === 0) return '';
+  const col = alias ? `${alias}.session_id` : 'session_id';
+  return ` AND ${col} NOT IN (
+    SELECT session_id FROM analytics_events WHERE user_id IN (${analyticsExcludedIds.join(',')})
+  )`;
+}
 function parseAnalyticsRange(reqQuery) {
   const to = reqQuery.to ? new Date(`${reqQuery.to}T23:59:59.999Z`) : new Date();
   const from = reqQuery.from
@@ -4732,6 +4781,244 @@ function attributionFilter(reqQuery, params) {
   )`;
 }
 
+// Ключевые показатели периода со сравнением с предыдущим таким же
+// отрезком. Всё считает бэкенд: проценты изменения на фронте означали бы
+// два определения одной метрики в двух местах.
+//
+// Определения зафиксированы здесь и только здесь:
+//   посетители — уникальные Telegram id среди событий периода;
+//   сессии     — уникальные session_id (одно открытие мини-аппа = сессия;
+//                идентификатор живёт в памяти вкладки, таймаута нет —
+//                см. migrations/023);
+//   заказы     — события order_placed (это шаг воронки, а не строки в
+//                orders: там своя жизнь со статусами);
+//   выручка и средний чек — из orders, по статусам, которые реально есть
+//                в системе.
+//
+// Конверсия — доля СЕССИЙ, дошедших до заказа. Не «заказы / посетители»:
+// один человек может заказать дважды за неделю, и такая дробь дала бы
+// больше 100%.
+app.get('/api/admin/analytics/overview', requireAuth, async (req, res) => {
+  try {
+    const { from, to } = parseAnalyticsRange(req.query);
+    // Предыдущий отрезок той же длины, впритык к началу текущего.
+    const spanMs = new Date(to).getTime() - new Date(from).getTime();
+    const prevTo = from;
+    const prevFrom = new Date(new Date(from).getTime() - spanMs).toISOString();
+
+    const excl = analyticsExclusionSql();
+    const periodSql = `
+      SELECT
+        COUNT(DISTINCT session_id)::int AS sessions,
+        COUNT(DISTINCT user_id)::int    AS visitors,
+        COUNT(DISTINCT CASE WHEN event_type = 'order_placed' THEN session_id END)::int AS order_sessions
+      FROM analytics_events
+      WHERE created_at >= $1 AND created_at < $2${excl}`;
+
+    const [cur, prev, orders, prevOrders] = await Promise.all([
+      query(periodSql, [from, to]),
+      query(periodSql, [prevFrom, prevTo]),
+      // Заказы берём из orders, а не из событий: там настоящие суммы и
+      // настоящие статусы. Отменённые в выручку не идут.
+      query(
+        `SELECT
+           COUNT(*)::int AS total,
+           COUNT(*) FILTER (WHERE status <> 'cancelled')::int AS active,
+           COUNT(*) FILTER (WHERE status = 'cancelled')::int  AS cancelled,
+           COUNT(*) FILTER (WHERE status = 'delivered')::int  AS delivered,
+           COALESCE(SUM(total) FILTER (WHERE status <> 'cancelled'), 0)::int AS revenue
+         FROM orders WHERE created_at >= $1 AND created_at < $2`,
+        [from, to]
+      ),
+      query(
+        `SELECT COUNT(*) FILTER (WHERE status <> 'cancelled')::int AS active,
+                COALESCE(SUM(total) FILTER (WHERE status <> 'cancelled'), 0)::int AS revenue
+         FROM orders WHERE created_at >= $1 AND created_at < $2`,
+        [prevFrom, prevTo]
+      ),
+    ]);
+
+    const c = cur.rows[0];
+    const p = prev.rows[0];
+    const o = orders.rows[0];
+    const po = prevOrders.rows[0];
+
+    // Сравнивать не с чем, если в прошлом периоде ноль: рост «с нуля» в
+    // процентах не выражается, и рисовать «+100%» значило бы соврать.
+    const change = (now, before) => (before > 0 ? Math.round(((now - before) / before) * 1000) / 10 : null);
+
+    // Проценты не показываем на слишком малых числах: при трёх сессиях
+    // «конверсия 33%» — это не показатель, а случайность. Порог общий для
+    // всех долей в ответе.
+    const MIN_FOR_RATE = 20;
+    const rate = (num, den) => (den >= MIN_FOR_RATE ? Math.round((num / den) * 1000) / 10 : null);
+
+    res.json({
+      from, to, prevFrom, prevTo,
+      minSampleForRates: MIN_FOR_RATE,
+      metrics: {
+        visitors:   { value: c.visitors,   prev: p.visitors,   changePct: change(c.visitors, p.visitors) },
+        sessions:   { value: c.sessions,   prev: p.sessions,   changePct: change(c.sessions, p.sessions) },
+        orders:     { value: o.active,     prev: po.active,    changePct: change(o.active, po.active) },
+        revenue:    { value: o.revenue,    prev: po.revenue,   changePct: change(o.revenue, po.revenue) },
+        conversion: { value: rate(c.order_sessions, c.sessions), prev: rate(0, p.sessions), changePct: null },
+        avgCheck:   { value: o.active > 0 ? Math.round(o.revenue / o.active) : null, prev: null, changePct: null },
+      },
+      orderStatuses: { total: o.total, active: o.active, cancelled: o.cancelled, delivered: o.delivered },
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Товарная аналитика: просмотры карточки, добавления в корзину и реальные
+// продажи из заказов. Три агрегата собираются тремя запросами и
+// склеиваются по id в JS — по запросу на товар это были бы сотни
+// обращений.
+app.get('/api/admin/analytics/products', requireAuth, async (req, res) => {
+  try {
+    const { from, to } = parseAnalyticsRange(req.query);
+    const excl = analyticsExclusionSql();
+
+    const [viewsRes, cartsRes, soldRes, titlesRes] = await Promise.all([
+      query(
+        `SELECT metadata->>'productId' AS id,
+                COUNT(DISTINCT session_id)::int AS sessions
+         FROM analytics_events
+         WHERE event_type = 'screen_view' AND screen_name = 'product'
+           AND metadata->>'productId' IS NOT NULL
+           AND created_at >= $1 AND created_at < $2${excl}
+         GROUP BY 1`,
+        [from, to]
+      ),
+      query(
+        `SELECT metadata->>'productId' AS id,
+                COUNT(DISTINCT session_id)::int AS sessions
+         FROM analytics_events
+         WHERE event_type = 'add_to_cart'
+           AND metadata->>'productId' IS NOT NULL
+           AND created_at >= $1 AND created_at < $2${excl}
+         GROUP BY 1`,
+        [from, to]
+      ),
+      // Проданные единицы и выручка — из позиций заказов. Подарки за
+      // баллы (isReward) не считаем продажей, как и в /api/admin/stats.
+      query(
+        `SELECT item->>'id' AS id,
+                SUM((item->>'qty')::int)::int AS units,
+                SUM((item->>'qty')::int * (item->>'price')::int)::int AS revenue,
+                COUNT(DISTINCT o.id)::int AS orders
+         FROM orders o, jsonb_array_elements(o.items) AS item
+         WHERE o.status <> 'cancelled'
+           AND (item->>'isReward')::boolean IS NOT TRUE
+           AND o.created_at >= $1 AND o.created_at < $2
+         GROUP BY 1`,
+        [from, to]
+      ),
+      query('SELECT id, title FROM products'),
+    ]);
+
+    const title = Object.fromEntries(titlesRes.rows.map((r) => [r.id, r.title]));
+    const byId = {};
+    const touch = (id) => {
+      if (!id) return null;
+      if (!byId[id]) byId[id] = { id, title: title[id] || id, views: 0, addToCart: 0, units: 0, revenue: 0, orders: 0 };
+      return byId[id];
+    };
+    viewsRes.rows.forEach((r) => { const t = touch(r.id); if (t) t.views = r.sessions; });
+    cartsRes.rows.forEach((r) => { const t = touch(r.id); if (t) t.addToCart = r.sessions; });
+    soldRes.rows.forEach((r) => { const t = touch(r.id); if (t) { t.units = r.units; t.revenue = r.revenue; t.orders = r.orders; } });
+
+    const items = Object.values(byId).map((x) => ({
+      ...x,
+      // Доля просмотров, закончившихся добавлением. На единичных
+      // просмотрах доля бессмысленна — тот же порог, что в overview.
+      addRatePct: x.views >= 10 ? Math.round((x.addToCart / x.views) * 1000) / 10 : null,
+    }));
+
+    res.json({
+      from, to,
+      minSampleForRates: 10,
+      topViewed: [...items].sort((a, b) => b.views - a.views).slice(0, 10),
+      topAdded: [...items].sort((a, b) => b.addToCart - a.addToCart).filter((x) => x.addToCart > 0).slice(0, 10),
+      topSold: [...items].sort((a, b) => b.units - a.units).filter((x) => x.units > 0).slice(0, 10),
+      // «Смотрят, но не добавляют» — только там, где просмотров достаточно,
+      // чтобы это что-то значило.
+      viewedNotAdded: items
+        .filter((x) => x.views >= 10 && x.addToCart === 0)
+        .sort((a, b) => b.views - a.views)
+        .slice(0, 10),
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ── Управление списком исключённых из аналитики ─────────────────────────
+//
+// Telegram id наружу не отдаём: в интерфейсе показывается подпись и
+// причина. Для удаления хватает той же подписи и внутреннего ключа.
+app.get('/api/admin/analytics/excluded', requireAuth, async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT x.telegram_id, x.reason, x.note, x.is_active, u.first_name, u.username,
+              (SELECT COUNT(DISTINCT session_id)::int FROM analytics_events e WHERE e.user_id = x.telegram_id) AS sessions
+       FROM analytics_excluded_users x
+       LEFT JOIN users u ON u.telegram_id = x.telegram_id
+       ORDER BY x.created_at ASC`
+    );
+    res.json(r.rows.map((x) => ({
+      // Ключ для операций — хэш не нужен, но и «светить» id в таблице не
+      // будем: фронт его не печатает, только передаёт обратно.
+      id: String(x.telegram_id),
+      reason: x.reason,
+      note: x.note || x.first_name || 'Без подписи',
+      isActive: x.is_active,
+      sessions: x.sessions,
+    })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+app.post('/api/admin/analytics/excluded', requireAuth, async (req, res) => {
+  const telegramId = Number(req.body?.telegramId);
+  if (!Number.isFinite(telegramId)) return res.status(400).json({ error: 'Укажите telegramId' });
+  try {
+    await query(
+      `INSERT INTO analytics_excluded_users (telegram_id, reason, note)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (telegram_id) DO UPDATE SET is_active = true, reason = EXCLUDED.reason, note = EXCLUDED.note`,
+      [telegramId, req.body?.reason || 'test', req.body?.note || null]
+    );
+    await loadAnalyticsExclusions();
+    res.status(201).json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Выключение, а не удаление: история исключения сохраняется, цифры
+// возвращаются ровно те же, что были бы без него.
+app.put('/api/admin/analytics/excluded/:telegram_id', requireAuth, async (req, res) => {
+  try {
+    const r = await query(
+      'UPDATE analytics_excluded_users SET is_active = $1 WHERE telegram_id = $2 RETURNING telegram_id',
+      [req.body?.isActive === true, req.params.telegram_id]
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: 'Запись не найдена' });
+    await loadAnalyticsExclusions();
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
 // Воронка: для каждого шага — уникальные session_id за период (не строго
 // последовательно — сессия считается "дошедшей" до шага, если у неё есть
 // хоть одно подходящее событие в диапазоне), и % отвала от предыдущего шага.
@@ -4746,7 +5033,7 @@ app.get('/api/admin/analytics/funnel', requireAuth, async (req, res) => {
     const unionSql = Object.entries(FUNNEL_EVENT_SQL)
       .map(([key, predicate]) => `SELECT '${key}' AS step, COUNT(DISTINCT session_id)::int AS count
         FROM analytics_events
-        WHERE (${predicate}) AND created_at >= $1 AND created_at < $2${
+        WHERE (${predicate}) AND created_at >= $1 AND created_at < $2${analyticsExclusionSql()}${
           // landing_viewed приходит с лендинга, где никакого app_opened и
           // никакой атрибуции в нашем смысле нет — фильтр по источнику к
           // нему неприменим, иначе он всегда обнулялся бы.
@@ -4855,7 +5142,7 @@ app.get('/api/admin/analytics/sessions', requireAuth, async (req, res) => {
              END
            ) AS final_step_rank
          FROM analytics_events
-         WHERE created_at >= $1 AND created_at < $2 ${userFilter}${attrWhere}
+         WHERE created_at >= $1 AND created_at < $2 ${userFilter}${attrWhere}${req.query.user_id ? "" : analyticsExclusionSql()}
          GROUP BY session_id
        )
        SELECT sess.*, u.first_name, u.username, u.phone
@@ -4891,7 +5178,7 @@ app.get('/api/admin/analytics/sources', requireAuth, async (req, res) => {
       `SELECT utm_source, utm_campaign, COUNT(DISTINCT session_id)::int AS sessions
        FROM analytics_events
        WHERE event_type = 'app_opened' AND utm_source IS NOT NULL
-         AND created_at >= $1 AND created_at < $2
+         AND created_at >= $1 AND created_at < $2${analyticsExclusionSql()}
        GROUP BY utm_source, utm_campaign
        ORDER BY sessions DESC`,
       [from, to]
@@ -4947,7 +5234,7 @@ app.get('/api/admin/analytics/top-screens', requireAuth, async (req, res) => {
       `SELECT screen_name, COUNT(*)::int AS views
        FROM analytics_events
        WHERE event_type = 'screen_view' AND screen_name IS NOT NULL
-         AND created_at >= $1 AND created_at < $2
+         AND created_at >= $1 AND created_at < $2${analyticsExclusionSql()}
        GROUP BY screen_name
        ORDER BY views DESC`,
       [from, to]
@@ -5439,6 +5726,7 @@ app.put('/api/admin/pricing-settings', requireAuth, async (req, res) => {
 // ============================================================
 
 loadSettings().catch((e) => console.error('loadSettings error:', e));
+loadAnalyticsExclusions();
 
 // Периодическое обновление кэша настроек.
 //
