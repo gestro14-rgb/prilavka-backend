@@ -17,6 +17,16 @@ const url = 'http://127.0.0.1:' + (process.env.PORT || 3001);
 const token = jwt.sign({ sub: 0, username: 'catalog-content' }, process.env.JWT_SECRET, { expiresIn: '20m' });
 const H = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token };
 
+const printTotals = async () => {
+  const after = await query(
+    `SELECT COUNT(*)::int AS total,
+            COUNT(*) FILTER (WHERE nutrition IS NOT NULL)::int AS with_nut
+       FROM products WHERE category <> 'bundles'`
+  );
+  const afterLinks = await query('SELECT COUNT(*)::int AS n FROM product_badges');
+  console.log(`после: товаров ${after.rows[0].total}, с БЖУ ${after.rows[0].with_nut}, связей ${afterLinks.rows[0].n}`);
+};
+
 const run = async () => {
   const before = await query('SELECT COUNT(*)::int AS n FROM products');
   const beforeLinks = await query('SELECT COUNT(*)::int AS n FROM product_badges');
@@ -47,7 +57,21 @@ const run = async () => {
   }
   console.log('БЖУ записано: ' + nutDone);
 
-  // 3. Бейджи — через admin API, как из формы товара.
+  // 3. Бейджи. ОТКЛЮЧЕНО.
+  //
+  // Эти назначения были откачены по просьбе владельца (см.
+  // rollback-claude-badges.js): 65 связей удалено, остались только 15
+  // ручных. Повторный запуск скрипта без флага вернул бы удалённое —
+  // поэтому шаг требует явного --with-badges. Библиотеку badges это не
+  // касается вовсе, она жива и нужна.
+  if (!process.argv.includes('--with-badges')) {
+    console.log('бейджи: шаг пропущен (откачен владельцем; нужен флаг --with-badges)');
+    await printTotals();
+    await pool.end();
+    return;
+  }
+
+  // 3a. Назначение — через admin API, как из формы товара.
   //
   // PUT заменяет список целиком, поэтому товары, которым бейдж уже
   // назначили руками, скрипт не трогает вовсе: это чужое решение, и
@@ -83,13 +107,7 @@ const run = async () => {
   }
   console.log('товаров с бейджами: ' + badgeProducts + ', связей: ' + badgeLinks + ', пропущено (уже были): ' + badgeSkipped);
 
-  const after = await query(
-    `SELECT COUNT(*)::int AS total,
-            COUNT(*) FILTER (WHERE nutrition IS NOT NULL)::int AS with_nut
-       FROM products WHERE category <> 'bundles'`
-  );
-  const afterLinks = await query('SELECT COUNT(*)::int AS n FROM product_badges');
-  console.log(`после: товаров ${after.rows[0].total}, с БЖУ ${after.rows[0].with_nut}, связей ${afterLinks.rows[0].n}`);
+  await printTotals();
   await pool.end();
 };
 
