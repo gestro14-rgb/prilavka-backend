@@ -160,6 +160,11 @@ function toProductDTO(row) {
     // reviews/набор_состав/home_product_shelves и orders.items (JSON-снимок).
     slug: row.slug || row.id,
     title: row.title,
+    // Происхождение (migrations/059) — отдельная строка под названием на
+    // странице товара и в карточке каталога. Раньше география жила внутри
+    // title («Арбуз, Дагестан»); теперь название чистое, а регион — здесь.
+    // null — не указано, фронт строку просто не рисует.
+    origin: row.origin || null,
     price: row.price,
     // "Было" для зачёркнутой цены (см. PriceTag.jsx) — null, если скидки нет.
     oldPrice: row.old_price != null ? Number(row.old_price) : null,
@@ -2643,8 +2648,8 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
       : null;
     await query(
       `INSERT INTO products
-        (id, slug, title, price, old_price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg, individual_margin_percent, price_per_kg, home_video_url, card_emoji, card_title, card_subtitle, tag_label, tag_color, audience_label, term_label, contents_summary)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37)`,
+        (id, slug, title, price, old_price, weight, emoji, bg, category, badge_type, badge_label, badge_color, composition, suppliers, pricing, is_active, in_stock, sort_order, image_url, is_bundle, subcategory_id, nutrition, home_image_url, purchase_price, pricing_unit, weight_kg, individual_margin_percent, price_per_kg, home_video_url, card_emoji, card_title, card_subtitle, tag_label, tag_color, audience_label, term_label, contents_summary, origin)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38)`,
       [
         p.id,
         p.slug || p.id,
@@ -2683,6 +2688,7 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
         p.audienceLabel || null,
         p.termLabel || null,
         p.contentsSummary && p.contentsSummary.length ? JSON.stringify(p.contentsSummary) : null,
+        p.origin?.trim() || null,
       ]
     );
     const result = await query('SELECT * FROM products WHERE id = $1', [p.id]);
@@ -2765,8 +2771,9 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         audience_label = $34,
         term_label = $35,
         contents_summary = $36,
+        origin = $37,
         updated_at = now()
-       WHERE id = $37`,
+       WHERE id = $38`,
       [
         p.title ?? cur.title,
         p.price ?? cur.price,
@@ -2810,6 +2817,9 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
         p.contentsSummary !== undefined
           ? (p.contentsSummary && p.contentsSummary.length ? JSON.stringify(p.contentsSummary) : null)
           : (cur.contents_summary ? JSON.stringify(cur.contents_summary) : null),
+        // Пустая строка из формы = «стереть происхождение», поле не
+        // передали вовсе = оставить как было.
+        p.origin !== undefined ? (p.origin?.trim() || null) : (cur.origin || null),
         req.params.id,
       ]
     );
