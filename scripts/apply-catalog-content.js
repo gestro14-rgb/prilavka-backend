@@ -47,12 +47,29 @@ const run = async () => {
   }
   console.log('БЖУ записано: ' + nutDone);
 
-  // 3. Бейджи — через admin API, как из формы товара
+  // 3. Бейджи — через admin API, как из формы товара.
+  //
+  // PUT заменяет список целиком, поэтому товары, которым бейдж уже
+  // назначили руками, скрипт не трогает вовсе: это чужое решение, и
+  // «улучшить» его молча нельзя. Такие позиции просто перечисляются в
+  // выводе — что с ними делать, решает владелец.
   const lib = await (await fetch(url + '/api/admin/badges', { headers: H })).json();
   const findId = (label, icon) => lib.find((b) => b.label === label && (b.icon || '') === icon)?.id;
+  const busy = await query(
+    `SELECT pb.product_id, string_agg(b.label || ' ' || COALESCE(b.icon, ''), ' + ') AS labels
+       FROM product_badges pb JOIN badges b ON b.id = pb.badge_id
+      GROUP BY pb.product_id`
+  );
+  const already = new Map(busy.rows.map((r) => [r.product_id, r.labels]));
   let badgeProducts = 0;
   let badgeLinks = 0;
+  let badgeSkipped = 0;
   for (const [id, list] of Object.entries(BADGES)) {
+    if (already.has(id)) {
+      console.log('пропуск (бейдж уже назначен) ' + id + ': ' + already.get(id));
+      badgeSkipped += 1;
+      continue;
+    }
     const ids = list.map(([l, i]) => findId(l, i)).filter(Boolean);
     if (ids.length !== list.length) { console.log('НЕ НАЙДЕН БЕЙДЖ для ' + id + ': ' + JSON.stringify(list)); continue; }
     if (!DRY) {
@@ -64,7 +81,7 @@ const run = async () => {
     badgeProducts += 1;
     badgeLinks += ids.length;
   }
-  console.log('товаров с бейджами: ' + badgeProducts + ', связей: ' + badgeLinks);
+  console.log('товаров с бейджами: ' + badgeProducts + ', связей: ' + badgeLinks + ', пропущено (уже были): ' + badgeSkipped);
 
   const after = await query(
     `SELECT COUNT(*)::int AS total,
