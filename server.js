@@ -3500,6 +3500,12 @@ app.get('/api/admin/reviews', requireAuth, async (req, res) => {
       imageUrl: r.image_url || null,
       status: r.status || 'published',
       telegramUserId: r.telegram_user_id || null,
+      // Заказ, по которому оставлен отзыв. Нужен админке: один отзыв
+      // покупателя лежит отдельной строкой на каждый товар заказа, и
+      // склеивать эти строки в одну карточку можно только по order_id —
+      // совпадение имени и текста ненадёжно. NULL у отзывов, добавленных
+      // в админке руками: заказа за ними нет.
+      orderId: r.order_id ?? null,
       productId: r.product_id || null,
       productTitle: r.product_title || null,
     })));
