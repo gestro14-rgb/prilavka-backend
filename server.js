@@ -1330,6 +1330,14 @@ app.get('/api/address-suggest', async (req, res) => {
   if (text.length < 3) {
     return res.json({ suggestions: [] });
   }
+  // Ключ Suggest API до сих пор не выпущен (это отдельная услуга Яндекса со
+  // своим ключом, геокодерный к ней не подходит — отдаёт 403). Пока его нет,
+  // отвечаем пустым списком, а не 500: фронт при отказе и так показывает
+  // пустоту, а ошибка на каждое нажатие клавиши забивала логи и прятала в них
+  // настоящие поломки. Появится ключ — достаточно убрать этот блок.
+  if (!YANDEX_SUGGEST_API_KEY) {
+    return res.json({ suggestions: [] });
+  }
   try {
     const suggestions = await suggestAddress(text);
     res.json({ suggestions });
