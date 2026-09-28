@@ -18,6 +18,7 @@ import { Upload } from '@aws-sdk/lib-storage';
 import busboy from 'busboy';
 import { v2 as cloudinary } from 'cloudinary';
 import multer from 'multer';
+import { createPartnerRoutes } from './partners.js';
 
 const app = express();
 app.use(cors());
@@ -30,6 +31,14 @@ const YANDEX_GEOCODER_API_KEY = process.env.YANDEX_GEOCODER_API_KEY || '';
 // (геокодер-ключ им не подходит). Автоподсказки при вводе адреса.
 const YANDEX_SUGGEST_API_KEY = process.env.YANDEX_SUGGEST_API_KEY || '';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+// Username бота — из него собираются партнёрские ссылки t.me/<бот>?start=p_…
+// Порядок источников: переменная окружения (можно переопределить, не трогая
+// код) → getMe при старте → зашитый фолбэк. Хардкодить одним значением
+// нельзя: смена username молча превратила бы все выданные партнёрам ссылки
+// в нерабочие, и заметили бы это только по пропавшим переходам.
+const TELEGRAM_BOT_USERNAME_FALLBACK = 'prilavka_eco_bot';
+let telegramBotUsername = process.env.TELEGRAM_BOT_USERNAME || TELEGRAM_BOT_USERNAME_FALLBACK;
+const getBotUsername = () => telegramBotUsername;
 const TELEGRAM_ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID || '';
 // Публичный URL мини-приложения — для web_app-кнопки в пуше "оставьте отзыв".
 const MINI_APP_URL = process.env.MINI_APP_URL || 'https://prilavka-app-production.up.railway.app';
@@ -47,6 +56,20 @@ cloudinary.config({
   api_key:    process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
+
+// Партнёрская программа (migrations/061). Живёт отдельным модулем, сюда
+// приходит только монтированием — см. partners.js. Зависимости передаём
+// параметрами, а не импортом оттуда: иначе два файла импортировали бы друг
+// друга. resolveUser/requireAuth объявлены ниже через function declaration,
+// поэтому на момент вызова уже подняты.
+const partnerModule = createPartnerRoutes({
+  query, pool,
+  resolveUser: (req, res, next) => resolveUser(req, res, next),
+  requireAuth: (req, res, next) => requireAuth(req, res, next),
+  getBotUsername,
+});
+app.use('/api/partner', partnerModule.router);
+app.use('/api/admin/partners', partnerModule.adminRouter);
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -704,6 +727,11 @@ async function upsertUser(telegramId, username, firstName) {
         // повторный заход по другой ссылке не меняет, откуда он пришёл.
         await attachAcquisition(user, telegramId);
       }
+      // Партнёрская связь создаётся раньше — в /start, когда строки в users
+      // ещё нет. Здесь достраиваем customer_id, как только она появилась.
+      // Вне ветки isNew: пользователь мог существовать до того, как перешёл
+      // по партнёрской ссылке, и тогда связь ждёт своего customer_id.
+      await partnerModule.linkCustomer(telegramId, user.id);
       return user;
     } catch (e) {
       if (e.code === '23505' && e.detail?.includes('referral_code')) continue;
@@ -5781,17 +5809,30 @@ app.post('/telegram-webhook', async (req, res) => {
       ? `${MINI_APP_URL}?src=${encodeURIComponent(payload)}`
       : MINI_APP_URL;
 
+    // Партнёрская ссылка (?start=p_<slug>) закрепляет клиента здесь же —
+    // это единственное место, куда payload реально доходит. Возвращённое
+    // значение нужно только чтобы понять, партнёрская ли это была ссылка;
+    // само закрепление уже произошло (или не произошло — если партнёр
+    // неактивен, slug не найден или это переход по собственной ссылке).
+    if (payload && telegramId) {
+      await partnerModule.attributeReferral(payload, telegramId);
+    }
+
+    // Вторая кнопка — только активному партнёру. Обычный покупатель видит
+    // ровно то же приветствие, что и раньше.
+    const partner = await partnerModule.findActivePartnerByTelegramId(telegramId).catch(() => null);
+    const keyboard = [[{ text: partner ? 'Открыть Прилавку' : 'Прилавка', web_app: { url: webAppUrl } }]];
+    if (partner) {
+      keyboard.push([{ text: 'Мой партнёрский кабинет', web_app: { url: `${MINI_APP_URL}/partner` } }]);
+    }
+
     await botRequestMultipart('sendPhoto', {
       file: { buffer: START_PHOTO_BUFFER, filename: 'start-photo.png' },
       fileField: 'photo',
       chat_id: msg.chat.id,
       caption: START_MESSAGE,
       parse_mode: 'HTML',
-      reply_markup: {
-        inline_keyboard: [[
-          { text: 'Прилавка', web_app: { url: webAppUrl } },
-        ]],
-      },
+      reply_markup: { inline_keyboard: keyboard },
     });
   }
 });
@@ -5956,6 +5997,15 @@ app.put('/api/admin/pricing-settings', requireAuth, async (req, res) => {
 
 loadSettings().catch((e) => console.error('loadSettings error:', e));
 loadAnalyticsExclusions();
+
+// Уточняем username бота у самого Telegram — но только если его не задали
+// переменной окружения: явно заданное значение важнее того, что вернёт API.
+// Ошибка не критична, останется фолбэк.
+if (!process.env.TELEGRAM_BOT_USERNAME) {
+  botRequest('getMe')
+    .then((r) => { if (r?.result?.username) telegramBotUsername = r.result.username; })
+    .catch((e) => console.error('getMe error:', e));
+}
 
 // Периодическое обновление кэша настроек.
 //
