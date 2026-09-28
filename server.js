@@ -48,6 +48,24 @@ const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || 'https://prilavka-b
 // setWebhook, поэтому не нужно хранить его отдельно между рестартами.
 const TELEGRAM_WEBHOOK_SECRET = crypto.randomBytes(32).toString('hex');
 
+// Кому показывать кнопку «Админка» в /start — строго по числовому Telegram id,
+// не по username: username меняется владельцем в любой момент, а id постоянен.
+//
+// Это ТОЛЬКО UX: кнопка открывает админку, но не пускает в неё. Авторизация
+// админки (requireAuth + пароль) остаётся обязательной, и наличие id в этом
+// списке само по себе не даёт никаких прав.
+const ADMIN_TELEGRAM_IDS = new Set(
+  (process.env.ADMIN_TELEGRAM_IDS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => /^\d+$/.test(s))
+);
+
+// Дефолта в коде намеренно НЕТ. Захардкоженный адрес у BACKEND_PUBLIC_URL
+// (строка ниже) однажды уже привёл к тому, что чужой сервис прописал себе
+// продовый URL и положил вебхук. Не задан — кнопки просто не будет.
+const ADMIN_APP_URL = process.env.ADMIN_APP_URL || '';
+
 const REFERRAL_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const REFERRAL_CODE_LENGTH = 6;
 
@@ -5831,20 +5849,47 @@ app.post('/telegram-webhook', async (req, res) => {
       : MINI_APP_URL;
 
     // Партнёрская ссылка (?start=p_<slug>) закрепляет клиента здесь же —
-    // это единственное место, куда payload реально доходит. Возвращённое
-    // значение нужно только чтобы понять, партнёрская ли это была ссылка;
-    // само закрепление уже произошло (или не произошло — если партнёр
-    // неактивен, slug не найден или это переход по собственной ссылке).
-    if (payload && telegramId) {
-      await partnerModule.attributeReferral(payload, telegramId);
+    // это единственное место, куда payload реально доходит.
+    try {
+      if (payload && telegramId) {
+        await partnerModule.attributeReferral(payload, telegramId);
+      }
+    } catch (e) {
+      // Сорванная атрибуция не повод не поздороваться с человеком.
+      console.error('/start attribution:', e);
     }
 
-    // Вторая кнопка — только активному партнёру. Обычный покупатель видит
-    // ровно то же приветствие, что и раньше.
-    const partner = await partnerModule.findActivePartnerByTelegramId(telegramId).catch(() => null);
-    const keyboard = [[{ text: partner ? 'Открыть Прилавку' : 'Прилавка', web_app: { url: webAppUrl } }]];
-    if (partner) {
-      keyboard.push([{ text: 'Мой партнёрский кабинет', web_app: { url: `${MINI_APP_URL}/partner` } }]);
+    // Базовая кнопка собирается ПЕРВОЙ и вне любых try: что бы ни случилось с
+    // партнёрской или админской логикой ниже, приветствие уходит хотя бы с
+    // ней. Раньше защита держалась на одном .catch() в строке, и следующая
+    // правка легко сняла бы её незаметно.
+    const keyboard = [[{ text: 'Открыть Прилавку', web_app: { url: webAppUrl } }]];
+
+    // Кнопка кабинета — только активному партнёру.
+    try {
+      const partner = await partnerModule.findActivePartnerByTelegramId(telegramId);
+      if (partner) {
+        keyboard.push([{ text: 'Мой партнёрский кабинет', web_app: { url: `${MINI_APP_URL}/partner` } }]);
+      }
+    } catch (e) {
+      console.error('/start partner button:', e);
+    }
+
+    // Кнопка админки — по числовому Telegram id из ADMIN_TELEGRAM_IDS.
+    // Обычная url-кнопка, а не web_app: админка — десктопная панель с JWT в
+    // localStorage, в Telegram WebView у неё будет своё хранилище, то есть
+    // вход придётся проходить заново, да ещё в тесном окне. В системном
+    // браузере уже есть сессия.
+    //
+    // Показывается, только если заданы ОБА параметра: без адреса кнопке
+    // некуда вести, без списка id — некому её показывать.
+    try {
+      if (ADMIN_APP_URL && ADMIN_TELEGRAM_IDS.size > 0 &&
+          telegramId != null && ADMIN_TELEGRAM_IDS.has(String(telegramId))) {
+        keyboard.push([{ text: 'Админка', url: ADMIN_APP_URL }]);
+      }
+    } catch (e) {
+      console.error('/start admin button:', e);
     }
 
     await botRequestMultipart('sendPhoto', {
