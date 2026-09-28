@@ -18,12 +18,12 @@ function cut(from, to) {
 }
 const code = [
   cut('function escapeHtml(text) {', '\n// Уведомление админу'),
-  cut('function formatOrderItem(item) {', '\n// Формирует читаемое'),
+  cut('function formatOrderItem(item, ambiguousTitles) {', '\n// Формирует читаемое'),
   cut('function formatOrderNotification(order) {', '\n// ============================================================\n// Публичные маршруты'),
 ].join('\n');
 
-const { formatOrderNotification, formatOrderItem, escapeHtml } =
-  new Function(`${code}\nreturn { formatOrderNotification, formatOrderItem, escapeHtml };`)();
+const { formatOrderNotification, formatOrderItem, ambiguousTitlesOf, escapeHtml } =
+  new Function(`${code}\nreturn { formatOrderNotification, formatOrderItem, ambiguousTitlesOf, escapeHtml };`)();
 
 let failed = 0;
 const check = (name, ok, detail = '') => {
@@ -56,15 +56,15 @@ const items = [
 const msg1 = formatOrderNotification({ ...baseOrder, items });
 
 console.log('\n── Вес / фасовка / origin / количество ──');
-check('фасовка «500 г» напечатана', msg1.includes('500 г × 2'));
-check('фасовка «1 кг» напечатана', msg1.includes('1 кг × 1'));
-check('штучная фасовка «10 шт» напечатана', msg1.includes('10 шт × 1'));
-check('origin «Ростовская область» напечатан', msg1.includes('· Ростовская область'));
-check('origin «Азербайджан» напечатан', msg1.includes('· Азербайджан'));
+check('фасовка «500 г» в скобках', msg1.includes('(500 г, Ростовская область) × 2'));
+check('фасовка «1 кг» в скобках', msg1.includes('(1 кг, Азербайджан) × 1'));
+check('штучная фасовка «10 шт» в скобках', msg1.includes('Яйцо куриное С1 (10 шт) × 1'));
+check('origin показан у неоднозначного названия', msg1.includes('Ростовская область') && msg1.includes('Азербайджан'));
+check('origin НЕ показан у однозначного названия', !msg1.includes('Виноград кишмиш (500 г, Узбекистан)') && msg1.includes('Виноград кишмиш (500 г) × 1'));
 check('товар без origin не получил висячий разделитель', !/Яйцо куриное С1\s*·/.test(msg1));
-check('два одинаковых названия различимы', msg1.includes('Помидоры Махитос · Ростовская область') && msg1.includes('Помидоры Махитос · Азербайджан'));
-check('×2 не превратилось в две строки', (msg1.match(/Помидоры Махитос · Ростовская область/g) || []).length === 1);
-check('сумма позиции на месте', msg1.includes('500 г × 2</b> — 360 ₽'));
+check('два одинаковых названия различимы', msg1.includes('Помидоры Махитос (500 г, Ростовская область)') && msg1.includes('Помидоры Махитос (1 кг, Азербайджан)'));
+check('×2 не превратилось в две строки', (msg1.match(/Ростовская область/g) || []).length === 1);
+check('сумма позиции на месте', msg1.includes('× 2</b> — 360 ₽'));
 
 // ── 2. Подарок: ровно один раз и только в своём блоке ────────────────────
 const gift = { title: 'Бесплатная зелень', emoji: '🌿', qty: 1, sum: 0, isReward: true };
@@ -133,7 +133,30 @@ check('амперсанд экранирован', msg4.includes('&amp;'));
 const opens = (msg4.match(/<b>/g) || []).length, closes = (msg4.match(/<\/b>/g) || []).length;
 check('теги <b> сбалансированы', opens === closes, `${opens} открывающих / ${closes} закрывающих`);
 
-// ── 5. Заказ с реальными данными каталога (только если есть БД) ──────────
+// ── 5. Точный состав production-заказа #0015 ─────────────────────────────
+// Позиции скопированы из orders.items как они лежат в проде (снимок старого
+// клиента: weight есть, origin/emoji нет — их достроит enrichOrderItems).
+console.log('\n── Реальный состав заказа #0015 ──');
+const o15 = formatOrderNotification({
+  ...baseOrder,
+  id: 15,
+  total: 2209,
+  items: [
+    { id: 'perets-zelyonyy-salatnyy-1782676064138', qty: 10, sum: 1890, title: 'Перец, Градиент', weight: '500 г', origin: 'Краснодар', emoji: '🌿', unitPrice: 189 },
+    { id: 'fasol-struchkovaya-1782676305948',       qty: 1,  sum: 319,  title: 'Фасоль стручковая', weight: '500 г', origin: 'Краснодар', emoji: '🥦', unitPrice: 319 },
+    { qty: 1, sum: 0, emoji: '🥗', title: 'Бесплатная зелень', isReward: true },
+  ],
+});
+console.log(o15.split('\n').slice(0, 8).join('\n'));
+// toLocaleString('ru-RU') разделяет разряды неразрывным пробелом, а не обычным —
+// сравниваем по нормализованным пробелам, иначе проверка ловит не формат, а юникод.
+const flat = (s) => s.replace(/[\s  ]+/g, ' ');
+check('строка перца ровно как просили', flat(o15).includes('• <b>Перец, Градиент (500 г) × 10</b> — 1 890 ₽'));
+check('строка фасоли ровно как просили', o15.includes('• <b>Фасоль стручковая (500 г) × 1</b> — 319 ₽'));
+check('origin «Краснодар» НЕ засоряет строки (названия разные)', !o15.includes('Краснодар'));
+check('подарок отдельным блоком и один раз', (o15.match(/Бесплатная зелень/g) || []).length === 1 && o15.includes('🎁 <b>ПОДАРОК — ПОЛОЖИТЬ В ЗАКАЗ:</b>'));
+
+// ── 6. Заказ с реальными данными каталога (только если есть БД) ──────────
 if (process.env.VERIFY_WITH_CATALOG === '1') {
   console.log('\n── Прод-каталог (read-only SELECT, ничего не пишем) ──');
   const { query } = await import('./db.js');

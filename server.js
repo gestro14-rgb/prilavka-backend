@@ -783,30 +783,38 @@ async function enrichOrderItems(items) {
   });
 }
 
-// Позиция заказа в уведомлении — две строки, а не одна: сборщик ищет глазами
-// фасовку, а в хвосте строки с названием и ценой она терялась.
+// Позиция заказа — одна компактная строка:
 //
-//   🍅 Помидоры Махитос · Ростовская область
-//   500 г × 2 — 360 ₽
+//   • Перец, Градиент (500 г) × 10 — 1 890 ₽
 //
-// origin печатаем всегда, когда он есть: именно он различает два товара с
-// одинаковым названием, и решать за сборщика, «нужен ли он для различения»,
-// значит угадывать — лишняя строка с регионом дешевле перепутанной позиции.
-function formatOrderItem(item) {
-  const head = [
-    item.emoji,
-    escapeHtml(item.title || 'Товар'),
-    item.origin ? `· ${escapeHtml(item.origin)}` : null,
-  ].filter(Boolean).join(' ');
+// Фасовка в скобках сразу после названия, а не в хвосте строки: сборщик
+// читает «что взять» и «сколько весит одна штука» одним движением глаз.
+//
+// origin попадает в те же скобки ТОЛЬКО когда он что-то различает — то есть
+// когда в этом же заказе есть другая позиция с таким же названием:
+//
+//   • Виноград кишмиш (500 г, Узбекистан) × 1 — 390 ₽
+//   • Виноград кишмиш (500 г, Азербайджан) × 1 — 390 ₽
+//
+// Печатать регион всегда — значит удлинять каждую строку ради случая, который
+// бывает редко; какие названия неоднозначны, считается заранее по составу
+// заказа (ambiguousTitles) и передаётся сюда готовым множеством.
+function formatOrderItem(item, ambiguousTitles) {
+  const title = String(item.title || 'Товар');
 
   // Фасовки нет ни в снимке, ни в каталоге (товар удалён) — честно пишем, что
   // её неоткуда взять, вместо молчаливого пропуска: «× 2» без веса выглядит
   // как полноценная инструкция, а это не она.
-  const pack = item.weight ? escapeHtml(item.weight) : '⚠ фасовка не указана';
-  const sum = Number(item.sum) || 0;
-  const qtyLine = `<b>${pack} × ${item.qty}</b>` + (sum > 0 ? ` — ${sum.toLocaleString('ru-RU')} ₽` : '');
+  const facts = [
+    item.weight ? escapeHtml(item.weight) : '⚠ фасовка не указана',
+    ambiguousTitles.has(title) && item.origin ? escapeHtml(item.origin) : null,
+  ].filter(Boolean);
 
-  const out = [head, qtyLine];
+  const sum = Number(item.sum) || 0;
+  const out = [
+    `• <b>${escapeHtml(title)} (${facts.join(', ')}) × ${item.qty}</b>`
+    + (sum > 0 ? ` — ${sum.toLocaleString('ru-RU')} ₽` : ''),
+  ];
 
   // Набор с изменённым составом: клиент выкинул из него позиции, и положить
   // их — такая же ошибка сборки, как забыть подарок.
@@ -815,10 +823,21 @@ function formatOrderItem(item) {
       .filter((c) => c && c.status === 'removed')
       .map((c) => escapeHtml(c.name || ''))
       .filter(Boolean);
-    if (removed.length > 0) out.push(`↳ без: ${removed.join(', ')}`);
+    if (removed.length > 0) out.push(`  ↳ без: ${removed.join(', ')}`);
   }
 
   return out.join('\n');
+}
+
+// Названия, которые в этом заказе встречаются больше одного раза, — только у
+// них origin несёт информацию (см. formatOrderItem).
+function ambiguousTitlesOf(items) {
+  const seen = new Map();
+  for (const item of items) {
+    const t = String(item.title || 'Товар');
+    seen.set(t, (seen.get(t) || 0) + 1);
+  }
+  return new Set([...seen].filter(([, n]) => n > 1).map(([t]) => t));
 }
 
 // Формирует читаемое текстовое сообщение о новом заказе для уведомления в Telegram.
@@ -834,17 +853,18 @@ function formatOrderNotification(order) {
   const goods = allItems.filter((item) => item && item.isReward !== true);
   const rewards = allItems.filter((item) => item && item.isReward === true);
 
+  const ambiguousTitles = ambiguousTitlesOf(goods);
   let subtotal = 0;
   for (const item of goods) {
     subtotal += Number(item.sum) || 0;
-    lines.push(formatOrderItem(item));
-    lines.push('');
+    lines.push(formatOrderItem(item, ambiguousTitles));
   }
+  lines.push('');
 
   if (rewards.length > 0) {
     lines.push('🎁 <b>ПОДАРОК — ПОЛОЖИТЬ В ЗАКАЗ:</b>');
     for (const reward of rewards) {
-      lines.push(`${reward.emoji || '🎁'} <b>${escapeHtml(reward.title || 'Подарок')}</b> × ${reward.qty || 1}`);
+      lines.push(`<b>${escapeHtml(reward.title || 'Подарок')} × ${reward.qty || 1}</b>`);
     }
     lines.push('');
   }
