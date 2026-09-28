@@ -295,7 +295,7 @@ function toBundleItemDTO(row) {
 
 // votedReviewIds — Set id отзывов, за которые уже проголосовал текущий
 // пользователь (см. resolveUserOptional) — пусто/не передан для анонима.
-function toReviewDTO(row, votedReviewIds) {
+function toReviewDTO(row, votedReviewIds, productsByReview) {
   return {
     id: row.id,
     name: row.name,
@@ -305,12 +305,38 @@ function toReviewDTO(row, votedReviewIds) {
     emoji: row.emoji,
     imageUrl: row.image_url || null,
     orderId: row.order_id || null,
+    // Товары, к которым относится отзыв, и оценка каждого (migrations/060).
+    // Один отзыв может быть связан с несколькими товарами заказа — но сам
+    // отзыв при этом один, и в ленте он показывается один раз.
+    products: productsByReview?.get(row.id) || [],
     // avatar_url хранит только Telegram file_id (не протухает, не содержит
     // токена) — резолвится в реальную картинку через прокси-эндпоинт ниже.
     avatarUrl: row.avatar_url ? `${BACKEND_PUBLIC_URL}/api/avatar/${row.avatar_url}` : null,
     helpfulCount: row.helpful_count ?? 0,
     helpfulVotedByMe: votedReviewIds ? votedReviewIds.has(row.id) : false,
   };
+}
+
+// Товары отзывов: Map<reviewId, [{ id, title, stars }]> одним запросом на всю
+// страницу — тот же приём, что и у loadHelpfulVotedIds ниже, вместо N+1 на
+// каждую карточку отзыва. Товар, удалённый из каталога, в список не попадает
+// (JOIN), но сам отзыв остаётся — текст от этого не портится.
+async function loadReviewProducts(reviewIds) {
+  const map = new Map();
+  if (reviewIds.length === 0) return map;
+  const result = await query(
+    `SELECT rp.review_id, rp.product_id, rp.stars, p.title
+       FROM review_products rp
+       JOIN products p ON p.id = rp.product_id
+      WHERE rp.review_id = ANY($1)
+      ORDER BY rp.review_id, p.title`,
+    [reviewIds]
+  );
+  for (const r of result.rows) {
+    if (!map.has(r.review_id)) map.set(r.review_id, []);
+    map.get(r.review_id).push({ id: r.product_id, title: r.title, stars: r.stars });
+  }
+  return map;
 }
 
 // Множество id отзывов из reviewIds, за которые уже проголосовал userId —
@@ -1129,10 +1155,14 @@ app.get('/api/catalog', resolveUserOptional, async (req, res) => {
       // Агрегат рейтинга по товару — считаем один раз здесь, а не N+1 запросом
       // на каждую карточку каталога (см. GET /api/products/:id/reviews для
       // детального списка отзывов на странице товара).
+      // Оценка берётся из review_products, а не из reviews.stars: у отзыва
+      // общая оценка одна, а товарам покупатель мог поставить разные — на
+      // карточке должна стоять оценка именно этого товара (migrations/060).
       query(
-        `SELECT product_id, COUNT(*)::int AS count, AVG(stars)::float AS avg_stars
-         FROM reviews WHERE status = 'published' AND product_id IS NOT NULL
-         GROUP BY product_id`
+        `SELECT rp.product_id, COUNT(*)::int AS count, AVG(rp.stars)::float AS avg_stars
+         FROM review_products rp
+         JOIN reviews r ON r.id = rp.review_id AND r.status = 'published'
+         GROUP BY rp.product_id`
       ),
       // Ручные подборки витрин Главной (см. migrations/024) — только активные
       // товары, порядок = sort_order. Пустая витрина здесь = фронт сам
@@ -1154,7 +1184,11 @@ app.get('/api/catalog', resolveUserOptional, async (req, res) => {
       query('SELECT * FROM story_cards WHERE is_active = true ORDER BY sort_order ASC, id ASC'),
     ]);
 
-    const votedReviewIds = await loadHelpfulVotedIds(req.userId, reviewsRes.rows.map((r) => r.id));
+    const reviewIds = reviewsRes.rows.map((r) => r.id);
+    const [votedReviewIds, reviewProducts] = await Promise.all([
+      loadHelpfulVotedIds(req.userId, reviewIds),
+      loadReviewProducts(reviewIds),
+    ]);
 
     const compositionsByProduct = {};
     for (const row of compositionsRes.rows) {
@@ -1247,7 +1281,7 @@ app.get('/api/catalog', resolveUserOptional, async (req, res) => {
           badges: badgesByProduct[row.id] ?? [],
         };
       }),
-      reviews: reviewsRes.rows.map((row) => toReviewDTO(row, votedReviewIds)),
+      reviews: reviewsRes.rows.map((row) => toReviewDTO(row, votedReviewIds, reviewProducts)),
       reviewStats: toReviewStatsDTO(reviewStatsRes.rows[0]),
       deliveries: deliveriesRes.rows.map((d) => ({
         emoji: d.emoji,
@@ -1333,9 +1367,13 @@ app.get('/api/reviews', resolveUserOptional, async (req, res) => {
     ]);
     const hasMore = listRes.rows.length > limit;
     const pageRows = listRes.rows.slice(0, limit);
-    const votedReviewIds = await loadHelpfulVotedIds(req.userId, pageRows.map((r) => r.id));
+    const pageIds = pageRows.map((r) => r.id);
+    const [votedReviewIds, reviewProducts] = await Promise.all([
+      loadHelpfulVotedIds(req.userId, pageIds),
+      loadReviewProducts(pageIds),
+    ]);
     res.json({
-      reviews: pageRows.map((row) => toReviewDTO(row, votedReviewIds)),
+      reviews: pageRows.map((row) => toReviewDTO(row, votedReviewIds, reviewProducts)),
       hasMore,
       stats: toReviewStatsDTO(statsRes.rows[0]),
     });
@@ -1353,20 +1391,34 @@ app.get('/api/products/:id/reviews', resolveUserOptional, async (req, res) => {
   const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
   try {
     const [listRes, statsRes] = await Promise.all([
+      // Связь, а не reviews.product_id: один отзыв может относиться сразу к
+      // нескольким товарам заказа и обязан показаться на странице каждого из
+      // них — по одному разу (migrations/060).
       query(
-        "SELECT * FROM reviews WHERE product_id = $1 AND status = 'published' ORDER BY id DESC LIMIT $2 OFFSET $3",
+        `SELECT r.* FROM reviews r
+           JOIN review_products rp ON rp.review_id = r.id
+          WHERE rp.product_id = $1 AND r.status = 'published'
+          ORDER BY r.id DESC LIMIT $2 OFFSET $3`,
         [productId, limit + 1, offset]
       ),
+      // Рейтинг товара — по оценке ИМЕННО этого товара в каждом отзыве.
       query(
-        "SELECT COUNT(*)::int AS count, COALESCE(AVG(stars), 0)::float AS avg_stars FROM reviews WHERE product_id = $1 AND status = 'published'",
+        `SELECT COUNT(*)::int AS count, COALESCE(AVG(rp.stars), 0)::float AS avg_stars
+           FROM review_products rp
+           JOIN reviews r ON r.id = rp.review_id AND r.status = 'published'
+          WHERE rp.product_id = $1`,
         [productId]
       ),
     ]);
     const hasMore = listRes.rows.length > limit;
     const pageRows = listRes.rows.slice(0, limit);
-    const votedReviewIds = await loadHelpfulVotedIds(req.userId, pageRows.map((r) => r.id));
+    const pageIds = pageRows.map((r) => r.id);
+    const [votedReviewIds, reviewProducts] = await Promise.all([
+      loadHelpfulVotedIds(req.userId, pageIds),
+      loadReviewProducts(pageIds),
+    ]);
     res.json({
-      reviews: pageRows.map((row) => toReviewDTO(row, votedReviewIds)),
+      reviews: pageRows.map((row) => toReviewDTO(row, votedReviewIds, reviewProducts)),
       hasMore,
       count: statsRes.rows[0].count,
       avgStars: Math.round(statsRes.rows[0].avg_stars * 10) / 10,
@@ -2169,33 +2221,51 @@ app.post('/api/orders/:id/review', async (req, res) => {
       }
     }
 
+    // Один отзыв — одна строка в reviews, товары уходят в review_products
+    // (migrations/060). Раньше здесь вставлялось по строке на каждый товар:
+    // текст дублировался, админка показывала по кнопке «Опубликовать» на
+    // каждую строку, а опубликованные строки давали столько же копий одного
+    // отзыва на Главной.
+    //
+    // reviews.stars — общая оценка отзыва: среднее по выставленным товарам
+    // (при одном товаре это просто его оценка). Оценка каждого товара
+    // отдельно живёт в связи и именно она идёт в рейтинг карточки.
     const insertedIds = [];
     try {
+      const emoji = REVIEW_EMOJIS[Math.floor(Math.random() * REVIEW_EMOJIS.length)];
+      const overallStars = Math.max(1, Math.min(5,
+        Math.round(reviewRows.reduce((a, r) => a + r.stars, 0) / reviewRows.length)));
+      const insertRes = await client.query(
+        `INSERT INTO reviews (name, area, stars, text, emoji, status, telegram_user_id, order_id, product_id, tags, image_url, avatar_url)
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, NULL, $8, $9, $10)
+         RETURNING id`,
+        [
+          (firstName || 'Клиент').trim(),
+          (area || '').trim() || 'Москва',
+          overallStars,
+          (text || '').trim() || null,
+          emoji,
+          telegramUserId,
+          orderId,
+          JSON.stringify(Array.isArray(tags) ? tags : []),
+          photoUrl || null,
+          avatarFileId,
+        ]
+      );
+      const reviewId = insertRes.rows[0].id;
+      insertedIds.push(reviewId);
+
       for (const r of reviewRows) {
-        const emoji = REVIEW_EMOJIS[Math.floor(Math.random() * REVIEW_EMOJIS.length)];
-        const insertRes = await client.query(
-          `INSERT INTO reviews (name, area, stars, text, emoji, status, telegram_user_id, order_id, product_id, tags, image_url, avatar_url)
-           VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $9, $10, $11)
-           RETURNING id`,
-          [
-            (firstName || 'Клиент').trim(),
-            (area || '').trim() || 'Москва',
-            r.stars,
-            (text || '').trim() || null,
-            emoji,
-            telegramUserId,
-            orderId,
-            r.productId,
-            JSON.stringify(Array.isArray(tags) ? tags : []),
-            photoUrl || null,
-            avatarFileId,
-          ]
+        if (!r.productId) continue; // отзыв о заказе целиком — связей нет
+        await client.query(
+          `INSERT INTO review_products (review_id, product_id, stars) VALUES ($1, $2, $3)
+           ON CONFLICT (review_id, product_id) DO UPDATE SET stars = EXCLUDED.stars`,
+          [reviewId, r.productId, r.stars]
         );
-        insertedIds.push(insertRes.rows[0].id);
       }
     } catch (e) {
       await client.query('ROLLBACK');
-      if (e.code === '23505') return res.status(409).json({ error: 'Вы уже оставляли отзыв по этому товару из этого заказа' });
+      if (e.code === '23505') return res.status(409).json({ error: 'Вы уже оставляли отзыв по этому заказу' });
       throw e;
     }
 
@@ -3613,10 +3683,17 @@ app.delete('/api/admin/promo-codes/:id', requireAuth, async (req, res) => {
 
 app.get('/api/admin/reviews', requireAuth, async (req, res) => {
   try {
+    // Один отзыв — одна строка и одна кнопка публикации. Товары приезжают
+    // массивом из связи (migrations/060); раньше админке приходилось
+    // склеивать строки по order_id вручную, и на каждую был свой статус.
     const result = await query(
-      `SELECT r.*, p.title AS product_title
+      `SELECT r.*, COALESCE(
+                (SELECT json_agg(json_build_object('id', rp.product_id, 'title', p.title, 'stars', rp.stars)
+                                 ORDER BY p.title)
+                   FROM review_products rp JOIN products p ON p.id = rp.product_id
+                  WHERE rp.review_id = r.id),
+                '[]'::json) AS products
        FROM reviews r
-       LEFT JOIN products p ON p.id = r.product_id
        ORDER BY r.id DESC`
     );
     res.json(result.rows.map((r) => ({
@@ -3636,8 +3713,9 @@ app.get('/api/admin/reviews', requireAuth, async (req, res) => {
       // совпадение имени и текста ненадёжно. NULL у отзывов, добавленных
       // в админке руками: заказа за ними нет.
       orderId: r.order_id ?? null,
-      productId: r.product_id || null,
-      productTitle: r.product_title || null,
+      // Товары отзыва и оценка каждого. Пустой массив — отзыв о заказе
+      // целиком или заведённый в админке руками.
+      products: r.products || [],
     })));
   } catch (e) {
     console.error(e);
