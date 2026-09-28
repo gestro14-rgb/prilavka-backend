@@ -68,20 +68,26 @@ export function createPartnerRoutes({ query, pool, resolveUser, requireAuth, get
   // Один запрос вместо четырёх: заказы приведённых клиентов достаются через
   // связь partner_referrals → users → orders, без partner_id в orders.
   //
-  // Отменённые заказы исключены везде, где речь про «сделал заказ»: клиент,
-  // чей единственный заказ отменён, не считается ни активным, ни принёсшим
-  // заказ. Для самого факта привлечения это неважно — он уже случился.
+  // Заказом считается только завершённый ('delivered') — то же, за что
+  // вообще может быть начислено вознаграждение. Клиент, чей единственный
+  // заказ отменён, приведённым остаётся: факт привлечения уже случился.
+  //
+  // Деньги («заработано», «доступно») берутся ТОЛЬКО из
+  // partner_transactions и не выводятся из заказов: после включения
+  // начислений источник истины по суммам один.
   const STATS_SQL = `
     WITH refs AS (
       SELECT pr.customer_id
         FROM partner_referrals pr
        WHERE pr.partner_id = $1 AND pr.status = 'active'
     ),
+    -- Только завершённые заказы: «Заказы» в кабинете считают то, за что
+    -- вообще может быть начислено, а не всё, что не отменено.
     ord AS (
       SELECT o.user_id, o.id, o.total, o.created_at
         FROM orders o
         JOIN refs ON refs.customer_id = o.user_id
-       WHERE o.status <> 'cancelled'
+       WHERE o.status = 'delivered'
     )
     SELECT
       (SELECT COUNT(*)::int FROM refs)                                AS customers,
@@ -213,9 +219,52 @@ export function createPartnerRoutes({ query, pool, resolveUser, requireAuth, get
     }
   });
 
+  // Условия партнёра в том виде, в каком их можно показать ему самому:
+  // человеческие формулировки, без админских полей и без служебных имён.
+  // null, когда начисления выключены — обещать условия, которые не работают,
+  // хуже, чем не показывать их вовсе.
+  function toTermsDTO(p) {
+    if (!p.reward_enabled) return null;
+    const first = Math.floor(Number(p.first_order_reward_amount) || 0);
+    const value = Number(p.repeat_reward_value) || 0;
+    const lines = [];
+    if (first > 0) lines.push(`${first.toLocaleString('ru-RU')} ₽ за первого клиента`);
+    if (value > 0) {
+      lines.push(p.repeat_reward_type === 'fixed'
+        ? `${Math.floor(value).toLocaleString('ru-RU')} ₽ с повторных заказов`
+        : `${value}% с повторных заказов`);
+    }
+    if (p.attribution_duration_months) {
+      lines.push(`начисления действуют ${p.attribution_duration_months} мес.`);
+    }
+    return lines.length > 0 ? lines : null;
+  }
+
   router.get('/dashboard', resolveUser, requirePartner, async (req, res) => {
     try {
-      res.json({ partner: toPartnerDTO(req.partner), stats: await loadStats(req.partner.id) });
+      // Последняя активность — реальные начисления, а не выдуманные события.
+      // Пять строк: больше на главной не нужно, для полного списка есть
+      // отдельный экран «Начисления».
+      const recent = await query(
+        `SELECT id, type, amount, status, order_id, customer_id, created_at
+           FROM partner_transactions WHERE partner_id = $1
+          ORDER BY id DESC LIMIT 5`,
+        [req.partner.id]
+      );
+      res.json({
+        partner: toPartnerDTO(req.partner),
+        stats: await loadStats(req.partner.id),
+        terms: toTermsDTO(req.partner),
+        recent: recent.rows.map((t) => ({
+          id: t.id,
+          type: t.type,
+          amount: t.amount,
+          status: t.status,
+          orderId: t.order_id,
+          customerLabel: t.customer_id ? `Клиент №${t.customer_id}` : null,
+          createdAt: t.created_at,
+        })),
+      });
     } catch (e) {
       console.error(e);
       res.status(500).json({ error: 'Ошибка сервера' });
@@ -234,12 +283,12 @@ export function createPartnerRoutes({ query, pool, resolveUser, requireAuth, get
                 COALESCE(SUM(o.total), 0)::int AS total
            FROM orders o
            JOIN partner_referrals pr ON pr.customer_id = o.user_id
-          WHERE pr.partner_id = $1 AND pr.status = 'active' AND o.status <> 'cancelled'
+          WHERE pr.partner_id = $1 AND pr.status = 'active' AND o.status = 'delivered'
             AND o.created_at > now() - interval '6 months'
           GROUP BY 1 ORDER BY 1`,
         [req.partner.id]
       );
-      res.json({ stats, series: series.rows });
+      res.json({ stats, series: series.rows, terms: toTermsDTO(req.partner) });
     } catch (e) {
       console.error(e);
       res.status(500).json({ error: 'Ошибка сервера' });
@@ -334,7 +383,7 @@ export function createPartnerRoutes({ query, pool, resolveUser, requireAuth, get
                (SELECT COUNT(*)::int FROM orders o
                   JOIN partner_referrals pr ON pr.customer_id = o.user_id
                  WHERE pr.partner_id = p.id AND pr.status = 'active'
-                   AND o.status <> 'cancelled') AS orders_count,
+                   AND o.status = 'delivered') AS orders_count,
                COALESCE((SELECT SUM(amount)::int FROM partner_transactions t
                  WHERE t.partner_id = p.id AND t.status IN ('available','paid')), 0) AS earned,
                COALESCE((SELECT SUM(amount)::int FROM partner_transactions t
@@ -365,6 +414,12 @@ export function createPartnerRoutes({ query, pool, resolveUser, requireAuth, get
       orders: row.orders_count ?? 0,
       earned: row.earned ?? 0,
       available: row.available ?? 0,
+      // Условия вознаграждения (migrations/062) — только для админки.
+      rewardEnabled: row.reward_enabled ?? false,
+      firstOrderRewardAmount: Number(row.first_order_reward_amount ?? 0),
+      repeatRewardType: row.repeat_reward_type || 'percentage',
+      repeatRewardValue: Number(row.repeat_reward_value ?? 0),
+      attributionDurationMonths: row.attribution_duration_months ?? null,
     };
   }
 
@@ -455,6 +510,58 @@ export function createPartnerRoutes({ query, pool, resolveUser, requireAuth, get
       }
       set('status', status);
     }
+    // ── Условия вознаграждения ───────────────────────────────────────────
+    // Меняются только на будущее: уже созданные partner_transactions хранят
+    // сумму снимком и здесь не пересчитываются ни при каких значениях.
+    const {
+      firstOrderRewardAmount, repeatRewardType, repeatRewardValue,
+      attributionDurationMonths, rewardEnabled,
+    } = req.body || {};
+
+    if (firstOrderRewardAmount !== undefined) {
+      const v = Number(firstOrderRewardAmount);
+      if (!Number.isFinite(v) || v < 0) {
+        return res.status(400).json({ error: 'Вознаграждение за первый заказ — число не меньше 0' });
+      }
+      set('first_order_reward_amount', v);
+    }
+    if (repeatRewardType !== undefined) {
+      if (repeatRewardType !== 'percentage' && repeatRewardType !== 'fixed') {
+        return res.status(400).json({ error: 'Тип повторного вознаграждения: percentage или fixed' });
+      }
+      set('repeat_reward_type', repeatRewardType);
+    }
+    if (repeatRewardValue !== undefined) {
+      const v = Number(repeatRewardValue);
+      if (!Number.isFinite(v) || v < 0) {
+        return res.status(400).json({ error: 'Вознаграждение за повторный заказ — число не меньше 0' });
+      }
+      // Процент проверяем против типа из этого же запроса, а если его не
+      // прислали — против сохранённого: иначе можно было бы завести 500%,
+      // поменяв тип и значение разными запросами.
+      let effectiveType = repeatRewardType;
+      if (effectiveType === undefined) {
+        const cur = await query('SELECT repeat_reward_type FROM partners WHERE id = $1', [req.params.id]);
+        effectiveType = cur.rows[0]?.repeat_reward_type || 'percentage';
+      }
+      if (effectiveType === 'percentage' && v > 100) {
+        return res.status(400).json({ error: 'Процент не может быть больше 100' });
+      }
+      set('repeat_reward_value', v);
+    }
+    if (attributionDurationMonths !== undefined) {
+      if (attributionDurationMonths === null || attributionDurationMonths === '') {
+        set('attribution_duration_months', null); // без ограничения
+      } else {
+        const v = Number(attributionDurationMonths);
+        if (!Number.isInteger(v) || v <= 0) {
+          return res.status(400).json({ error: 'Срок привязки — целое число месяцев больше 0 или «без ограничения»' });
+        }
+        set('attribution_duration_months', v);
+      }
+    }
+    if (rewardEnabled !== undefined) set('reward_enabled', Boolean(rewardEnabled));
+
     if (sets.length === 0) return res.status(400).json({ error: 'Нечего менять' });
 
     params.push(req.params.id);
@@ -482,9 +589,9 @@ export function createPartnerRoutes({ query, pool, resolveUser, requireAuth, get
       const r = await query(
         `SELECT pr.id, pr.telegram_user_id, pr.customer_id, pr.referred_at, pr.status,
                 u.first_name, u.username, u.phone,
-                COUNT(o.id) FILTER (WHERE o.status <> 'cancelled')::int AS orders_count,
-                COALESCE(SUM(o.total) FILTER (WHERE o.status <> 'cancelled'), 0)::int AS orders_total,
-                MIN(o.created_at) FILTER (WHERE o.status <> 'cancelled') AS first_order_at
+                COUNT(o.id) FILTER (WHERE o.status = 'delivered')::int AS orders_count,
+                COALESCE(SUM(o.total) FILTER (WHERE o.status = 'delivered'), 0)::int AS orders_total,
+                MIN(o.created_at) FILTER (WHERE o.status = 'delivered') AS first_order_at
            FROM partner_referrals pr
            LEFT JOIN users u ON u.id = pr.customer_id
            LEFT JOIN orders o ON o.user_id = pr.customer_id
@@ -549,5 +656,134 @@ export function createPartnerRoutes({ query, pool, resolveUser, requireAuth, get
     }
   });
 
-  return { router, adminRouter, attributeReferral, linkCustomer, findActivePartnerByTelegramId };
+  // ── Движок начислений ──────────────────────────────────────────────────
+  //
+  // Вызывается из PUT /api/admin/orders/:id при переходе статуса — там же,
+  // где уже начисляются баллы рефереру и покупателю. Своего хука или воркера
+  // не завожу: это был бы второй механизм там, где есть рабочий.
+  //
+  // Завершённым считается заказ в статусе 'delivered'. payment_status
+  // намеренно НЕ проверяется: у всех заказов на проде он 'pending', поле не
+  // поддерживается, и гейт по нему молча обнулил бы все начисления. По той же
+  // причине на него не смотрит и существующее начисление баллов покупателю.
+  const COMPLETED_STATUS = 'delivered';
+
+  // Сумма заказа после скидок — orders.total. Это не догадка: в POST
+  // /api/orders в колонку пишется finalTotal = total − discountAmount, то
+  // есть промокод, баллы и реферальная скидка уже вычтены. Отдельных
+  // final_total / paid_total в таблице нет.
+  const paidAmountOf = (order) => Number(order.total) || 0;
+
+  // Начисляет вознаграждение за завершённый заказ. Идемпотентна: повторный
+  // вызов по тому же заказу не создаст вторую строку — мешает уникальный
+  // индекс (order_id, type), и ON CONFLICT гасит гонку.
+  //
+  // Ничего не бросает наружу: смена статуса заказа не должна падать из-за
+  // партнёрской бухгалтерии.
+  async function accrueForOrder(order) {
+    try {
+      if (!order || order.status !== COMPLETED_STATUS || !order.user_id) return null;
+
+      const refRes = await query(
+        `SELECT pr.*, p.reward_enabled, p.first_order_reward_amount, p.repeat_reward_type,
+                p.repeat_reward_value, p.attribution_duration_months
+           FROM partner_referrals pr
+           JOIN partners p ON p.id = pr.partner_id
+          WHERE pr.customer_id = $1 AND pr.status = 'active'`,
+        [order.user_id]
+      );
+      const ref = refRes.rows[0];
+      if (!ref) return null;
+      if (!ref.reward_enabled) return null;
+
+      // Срок привязки. Проверяется ТОЛЬКО здесь, на начислении: сама связь
+      // не трогается никогда, FIRST PARTNER WINS остаётся в силе, и клиент
+      // не перепривязывается к другому партнёру — просто новые заказы
+      // перестают приносить деньги текущему. NULL — без ограничения.
+      if (ref.attribution_duration_months != null) {
+        const expRes = await query(
+          `SELECT ($1::timestamptz + make_interval(months => $2::int)) >= now() AS active`,
+          [ref.referred_at, ref.attribution_duration_months]
+        );
+        if (!expRes.rows[0]?.active) return null;
+      }
+
+      // Первый ли это завершённый заказ клиента. Текущий исключаем по id:
+      // на момент вызова он уже переведён в delivered.
+      const prevRes = await query(
+        `SELECT COUNT(*)::int AS n FROM orders
+          WHERE user_id = $1 AND status = $2 AND id <> $3`,
+        [order.user_id, COMPLETED_STATUS, order.id]
+      );
+      const isFirst = (prevRes.rows[0]?.n || 0) === 0;
+
+      let type, amount, description;
+      if (isFirst) {
+        type = 'referral_first_order';
+        amount = Math.floor(Number(ref.first_order_reward_amount) || 0);
+        description = `Первый заказ: ${amount} ₽ по условиям партнёра`;
+      } else {
+        type = 'repeat_order';
+        const paid = paidAmountOf(order);
+        const value = Number(ref.repeat_reward_value) || 0;
+        if (ref.repeat_reward_type === 'fixed') {
+          amount = Math.floor(value);
+          description = `Повторный заказ: фиксировано ${amount} ₽`;
+        } else {
+          // Вниз, а не к ближайшему: так же считаются баллы покупателю
+          // (Math.floor), и округление вверх означало бы переплату партнёру
+          // на копейки в каждом заказе.
+          amount = Math.floor((paid * value) / 100);
+          description = `Повторный заказ: ${value}% от ${paid} ₽`;
+        }
+      }
+
+      // Ноль — не повод заводить пустую строку в истории начислений.
+      if (!(amount > 0)) return null;
+
+      const ins = await query(
+        `INSERT INTO partner_transactions
+           (partner_id, customer_id, order_id, type, amount, status, description)
+         VALUES ($1, $2, $3, $4, $5, 'available', $6)
+         -- Предикат обязателен: idx_partner_transactions_order_type —
+         -- ЧАСТИЧНЫЙ индекс (WHERE order_id IS NOT NULL), и без повторения
+         -- его условия Postgres не находит арбитра и падает с 42P10.
+         ON CONFLICT (order_id, type) WHERE order_id IS NOT NULL DO NOTHING
+         RETURNING *`,
+        [ref.partner_id, order.user_id, order.id, type, amount, description]
+      );
+      return ins.rows[0] || null;
+    } catch (e) {
+      console.error('accrueForOrder:', e);
+      return null;
+    }
+  }
+
+  // Отмена заказа после начисления: переводим строку в 'cancelled', а не
+  // пишем отрицательную correction. Сумма и сама строка при этом не меняются
+  // никогда — меняется только статус, для которого колонка и заведена.
+  //
+  // Почему не correction: уникальный индекс (order_id, type) допускает ровно
+  // одну строку типа correction на заказ, а цикл delivered → cancelled →
+  // delivered в админке делается одним кликом и повторяется сколько угодно.
+  // Со статусами он отрабатывает корректно на любом числе итераций.
+  async function setOrderAccrualsCancelled(orderId, cancelled) {
+    try {
+      await query(
+        `UPDATE partner_transactions
+            SET status = $2
+          WHERE order_id = $1
+            AND type IN ('referral_first_order', 'repeat_order')
+            AND status = $3`,
+        [orderId, cancelled ? 'cancelled' : 'available', cancelled ? 'available' : 'cancelled']
+      );
+    } catch (e) {
+      console.error('setOrderAccrualsCancelled:', e);
+    }
+  }
+
+  return {
+    router, adminRouter, attributeReferral, linkCustomer, findActivePartnerByTelegramId,
+    accrueForOrder, setOrderAccrualsCancelled, COMPLETED_STATUS,
+  };
 }

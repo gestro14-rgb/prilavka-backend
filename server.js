@@ -3588,6 +3588,27 @@ app.put('/api/admin/orders/:id', requireAuth, async (req, res) => {
       }
     }
 
+    // Партнёрское вознаграждение (migrations/062). Стоит здесь же, где
+    // начисляются баллы рефереру и покупателю: это уже существующая точка
+    // перехода в «доставлен», и второй механизм рядом с рабочим не нужен.
+    //
+    // await, а не fire-and-forget: ответ админке должен приходить после
+    // того, как начисление записано, иначе повторное сохранение статуса
+    // успеет прийти раньше вставки. Дубль всё равно поймает уникальный
+    // индекс (order_id, type), но ждать дешевле, чем ловить гонку.
+    if (status === 'delivered' && cur.status !== 'delivered') {
+      await partnerModule.accrueForOrder(o);
+    }
+    // Отмена уже начисленного заказа — перевод строки в 'cancelled'.
+    // Обратный переход возвращает её в 'available', поэтому цикл
+    // delivered → cancelled → delivered отрабатывает сколько угодно раз.
+    if (status === 'cancelled' && cur.status !== 'cancelled') {
+      await partnerModule.setOrderAccrualsCancelled(o.id, true);
+    }
+    if (status === 'delivered' && cur.status === 'cancelled') {
+      await partnerModule.setOrderAccrualsCancelled(o.id, false);
+    }
+
     // Уведомляем пользователя о смене статуса (fire-and-forget)
     if (status && status !== cur.status && o.telegram_user_id && ORDER_STATUS_NOTIFICATIONS[status]) {
       sendTelegramMessageToChat(o.telegram_user_id, ORDER_STATUS_NOTIFICATIONS[status](o.id));
