@@ -742,20 +742,112 @@ const ORDER_STATUS_NOTIFICATIONS = {
   cancelled:   (id) => `❌ Заказ ${fmtOrderId(id)} отменён. Свяжитесь с нами если вопросы.`,
 };
 
+// Достраивает снимок позиций заказа полями, которые нужны сборщику: фасовка
+// (weight), происхождение (origin) и эмодзи.
+//
+// Мини-апп присылает weight сам (см. placeOrder в CartContext), но origin и
+// emoji в снимке не сохранялись вовсе, а у клиента со старой закэшированной
+// сборкой может не быть и weight — тогда от позиции в уведомлении остаётся
+// одно название, и «Помидоры» ничем не отличаются от «Помидоров» другой
+// фасовки или другого региона.
+//
+// Каталог читаем ОДИН раз и ровно здесь, в момент оформления: это ещё не
+// «сегодняшний вес вместо заказанного», а тот самый вес, по которому заказ
+// прямо сейчас и оформляют. Пришедшее от клиента имеет приоритет — он
+// прислал то, что реально видел на экране; из каталога подставляется только
+// то, чего в теле запроса нет.
+async function enrichOrderItems(items) {
+  const ids = [...new Set(items.map((i) => i && i.id).filter((id) => id != null).map(String))];
+  const catalog = {};
+  if (ids.length > 0) {
+    try {
+      const res = await query(
+        'SELECT id, title, weight, origin, emoji FROM products WHERE id = ANY($1)',
+        [ids]
+      );
+      for (const row of res.rows) catalog[String(row.id)] = row;
+    } catch (e) {
+      // Полнота снимка не стоит непринятого заказа — сохраняем что прислали.
+      console.error('Не удалось достроить снимок заказа из каталога:', e);
+    }
+  }
+  return items.map((item) => {
+    const p = catalog[String(item.id)];
+    return {
+      ...item,
+      title: item.title || p?.title || 'Товар',
+      weight: item.weight || p?.weight || null,
+      origin: item.origin ?? p?.origin ?? null,
+      emoji: item.emoji || p?.emoji || null,
+    };
+  });
+}
+
+// Позиция заказа в уведомлении — две строки, а не одна: сборщик ищет глазами
+// фасовку, а в хвосте строки с названием и ценой она терялась.
+//
+//   🍅 Помидоры Махитос · Ростовская область
+//   500 г × 2 — 360 ₽
+//
+// origin печатаем всегда, когда он есть: именно он различает два товара с
+// одинаковым названием, и решать за сборщика, «нужен ли он для различения»,
+// значит угадывать — лишняя строка с регионом дешевле перепутанной позиции.
+function formatOrderItem(item) {
+  const head = [
+    item.emoji,
+    escapeHtml(item.title || 'Товар'),
+    item.origin ? `· ${escapeHtml(item.origin)}` : null,
+  ].filter(Boolean).join(' ');
+
+  // Фасовки нет ни в снимке, ни в каталоге (товар удалён) — честно пишем, что
+  // её неоткуда взять, вместо молчаливого пропуска: «× 2» без веса выглядит
+  // как полноценная инструкция, а это не она.
+  const pack = item.weight ? escapeHtml(item.weight) : '⚠ фасовка не указана';
+  const sum = Number(item.sum) || 0;
+  const qtyLine = `<b>${pack} × ${item.qty}</b>` + (sum > 0 ? ` — ${sum.toLocaleString('ru-RU')} ₽` : '');
+
+  const out = [head, qtyLine];
+
+  // Набор с изменённым составом: клиент выкинул из него позиции, и положить
+  // их — такая же ошибка сборки, как забыть подарок.
+  if (Array.isArray(item.selectedComposition)) {
+    const removed = item.selectedComposition
+      .filter((c) => c && c.status === 'removed')
+      .map((c) => escapeHtml(c.name || ''))
+      .filter(Boolean);
+    if (removed.length > 0) out.push(`↳ без: ${removed.join(', ')}`);
+  }
+
+  return out.join('\n');
+}
+
 // Формирует читаемое текстовое сообщение о новом заказе для уведомления в Telegram.
 function formatOrderNotification(order) {
   const lines = [];
   lines.push(`🧺 <b>Новый заказ ${'#' + String(order.id).padStart(4, '0')}</b>`);
   lines.push('');
 
+  // Подарок идёт отдельным блоком ниже, а не вперемешку с покупками: в общем
+  // списке бесплатная позиция ничем не выделялась, и её уже один раз не
+  // положили в заказ.
+  const allItems = Array.isArray(order.items) ? order.items : [];
+  const goods = allItems.filter((item) => item && item.isReward !== true);
+  const rewards = allItems.filter((item) => item && item.isReward === true);
+
   let subtotal = 0;
-  if (Array.isArray(order.items)) {
-    for (const item of order.items) {
-      subtotal += Number(item.sum) || 0;
-      lines.push(`• ${item.title} × ${item.qty} — ${(Number(item.sum) || 0).toLocaleString('ru-RU')} ₽`);
-    }
+  for (const item of goods) {
+    subtotal += Number(item.sum) || 0;
+    lines.push(formatOrderItem(item));
+    lines.push('');
   }
-  lines.push('');
+
+  if (rewards.length > 0) {
+    lines.push('🎁 <b>ПОДАРОК — ПОЛОЖИТЬ В ЗАКАЗ:</b>');
+    for (const reward of rewards) {
+      lines.push(`${reward.emoji || '🎁'} <b>${escapeHtml(reward.title || 'Подарок')}</b> × ${reward.qty || 1}`);
+    }
+    lines.push('');
+  }
 
   // Разбивка сходится: товары − скидка = итог. Строку скидки показываем для
   // любой скидки (промокод / баллы / реферал), а не только промокода.
@@ -773,28 +865,32 @@ function formatOrderNotification(order) {
     lines.push(`📅 ${[dateStr, order.delivery_slot].filter(Boolean).join(', ')}`);
   }
 
+  // Дальше идёт всё, что клиент ввёл руками. Сообщение уходит с
+  // parse_mode: 'HTML', поэтому '<' в адресе или комментарии Telegram
+  // отклоняет целиком — и уведомления о заказе не приходит вовсе. Тот же
+  // escapeHtml, что уже стоит в notifyNewUser.
   if (order.address_street) {
-    lines.push(`📍 ${order.address_street}`);
+    lines.push(`📍 ${escapeHtml(order.address_street)}`);
   }
 
   if (order.address_details) {
     const d = order.address_details;
     const detailParts = [
-      d.entrance && `подъезд ${d.entrance}`,
-      d.floor && `этаж ${d.floor}`,
-      d.apartment && `кв. ${d.apartment}`,
-      d.intercom && `домофон ${d.intercom}`,
+      d.entrance && `подъезд ${escapeHtml(d.entrance)}`,
+      d.floor && `этаж ${escapeHtml(d.floor)}`,
+      d.apartment && `кв. ${escapeHtml(d.apartment)}`,
+      d.intercom && `домофон ${escapeHtml(d.intercom)}`,
     ].filter(Boolean);
     if (detailParts.length > 0) {
       lines.push(detailParts.join(', '));
     }
     if (d.comment) {
-      lines.push(`💬 ${d.comment}`);
+      lines.push(`💬 ${escapeHtml(d.comment)}`);
     }
   }
 
   if (order.comment) {
-    lines.push(`💬 Комментарий к заказу: ${order.comment}`);
+    lines.push(`💬 Комментарий к заказу: ${escapeHtml(order.comment)}`);
   }
 
   if (order.leave_at_door) {
@@ -808,6 +904,7 @@ function formatOrderNotification(order) {
   if (order.telegram_first_name || order.telegram_username) {
     const who = [order.telegram_first_name, order.telegram_username ? `@${order.telegram_username}` : null]
       .filter(Boolean)
+      .map(escapeHtml)
       .join(' ');
     lines.push(`👤 ${who}`);
   }
@@ -1658,9 +1755,14 @@ app.post('/api/orders', resolveUser, async (req, res) => {
     } catch (e) {
       // Таблица user_rewards может не существовать до миграции — не блокируем заказ
     }
+    // Снимок состава — то, что ляжет и в orders.items, и в уведомление
+    // сборщику. Одна и та же переменная в обоих местах намеренно: пока в
+    // Telegram уходил сырой items, подарок (он добавляется только сюда, в
+    // orderItems) в уведомление не попадал вовсе, и однажды его не положили.
+    const snapshotItems = await enrichOrderItems(items);
     const orderItems = pendingReward
-      ? [...items, { title: pendingReward.title, emoji: pendingReward.emoji || '🎁', qty: 1, sum: 0, isReward: true }]
-      : items;
+      ? [...snapshotItems, { title: pendingReward.title, emoji: pendingReward.emoji || '🎁', qty: 1, sum: 0, isReward: true }]
+      : snapshotItems;
 
     const result = await query(
       `INSERT INTO orders
@@ -1742,7 +1844,7 @@ app.post('/api/orders', resolveUser, async (req, res) => {
     // Уведомление в Telegram — не блокирует ответ клиенту, если не настроено или упало
     const notification = formatOrderNotification({
       id: order.id,
-      items,
+      items: orderItems,
       total: finalTotal,
       delivery_date: deliveryDate,
       delivery_slot: deliverySlot,
