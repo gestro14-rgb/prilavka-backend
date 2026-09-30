@@ -44,6 +44,10 @@ const TELEGRAM_ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID || '';
 const MINI_APP_URL = process.env.MINI_APP_URL || 'https://prilavka-app-production.up.railway.app';
 // Публичный URL этого API — куда Telegram будет слать апдейты вебхуком.
 const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || 'https://prilavka-backend-production.up.railway.app';
+// Право прописывать вебхук боту. Обязательный явный флаг: у продакшена
+// ENABLE_TELEGRAM_WEBHOOK=true, у всех остальных сред — false или ничего.
+// Подробно, с историей инцидента, — в комментарии к registerWebhook.
+const ENABLE_TELEGRAM_WEBHOOK = process.env.ENABLE_TELEGRAM_WEBHOOK === 'true';
 // Секрет вебхука — генерируется при каждом старте и тут же регистрируется в
 // setWebhook, поэтому не нужно хранить его отдельно между рестартами.
 const TELEGRAM_WEBHOOK_SECRET = crypto.randomBytes(32).toString('hex');
@@ -5905,17 +5909,56 @@ app.post('/telegram-webhook', async (req, res) => {
 
 // Регистрирует вебхук при каждом старте сервера — идемпотентно, безопасно
 // вызывать повторно (Telegram просто обновит URL/секрет на тот же).
+//
+// Право регистрировать вебхук есть РОВНО У ОДНОЙ среды, и даётся оно явным
+// ENABLE_TELEGRAM_WEBHOOK=true. Причина конкретная: 2026-09-28 дважды за день
+// приветствие переставало приходить всем пользователям. Сервис
+// prilavka-backend-preview-minorder держал тот же TELEGRAM_BOT_TOKEN, своего
+// BACKEND_PUBLIC_URL не имел и потому подставлял захардкоженный ПРОДОВЫЙ
+// адрес — то есть прописывал боту прод-URL со своим случайным секретом.
+// Telegram слал на прод чужой секрет, прод отвечал 401 на каждый апдейт, и
+// апдейты копились в очереди, не доходя до кода.
+//
+// Поэтому три независимые проверки: любой другой сервис с тем же токеном —
+// preview, staging, случайно восстановленный старый деплой — молча
+// пропускает регистрацию, даже если токен у него есть.
 async function registerWebhook() {
-  if (!TELEGRAM_BOT_TOKEN) return;
+  const target = `${BACKEND_PUBLIC_URL}/telegram-webhook`;
+  let host;
+  try { host = new URL(target).host; } catch { host = '(некорректный BACKEND_PUBLIC_URL)'; }
+
+  // Ни токен, ни секрет в лог не попадают — только факт, среда и хост.
+  console.log('Telegram webhook registration:');
+  console.log('  enabled:', ENABLE_TELEGRAM_WEBHOOK);
+  console.log('  environment:', process.env.RAILWAY_ENVIRONMENT_NAME || process.env.NODE_ENV || 'unknown');
+  console.log('  service:', process.env.RAILWAY_SERVICE_NAME || 'unknown');
+  console.log('  target host:', host);
+
+  if (!ENABLE_TELEGRAM_WEBHOOK) {
+    console.log('Telegram webhook registration skipped: ENABLE_TELEGRAM_WEBHOOK не "true"');
+    return;
+  }
+  if (!TELEGRAM_BOT_TOKEN) {
+    console.log('Telegram webhook registration skipped: нет TELEGRAM_BOT_TOKEN');
+    return;
+  }
+  // Адрес обязан быть задан ЯВНО. Дефолт в коде оставлен для остальных его
+  // потребителей (ссылки на аватарки), но регистрировать вебхук по
+  // умолчанию на чужой домен — ровно тот механизм, что дважды уронил /start.
+  if (!process.env.BACKEND_PUBLIC_URL) {
+    console.log('Telegram webhook registration skipped: BACKEND_PUBLIC_URL не задан явно');
+    return;
+  }
+
   const result = await botRequest('setWebhook', {
-    url: `${BACKEND_PUBLIC_URL}/telegram-webhook`,
+    url: target,
     secret_token: TELEGRAM_WEBHOOK_SECRET,
     allowed_updates: ['message'],
   });
   if (result === null) {
     console.error('Не удалось зарегистрировать Telegram-вебхук');
   } else {
-    console.log('Telegram-вебхук зарегистрирован:', `${BACKEND_PUBLIC_URL}/telegram-webhook`);
+    console.log('Telegram-вебхук зарегистрирован:', target);
   }
 }
 
