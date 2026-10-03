@@ -94,9 +94,11 @@ const partnerModule = createPartnerRoutes({
 app.use('/api/partner', partnerModule.router);
 app.use('/api/admin/partners', partnerModule.adminRouter);
 
-// Проверка связи с OpenAI — пока только POST /api/ai/test, см. ai.js.
-// Зависимостей у модуля нет: ни базы, ни авторизации он не трогает.
-app.use('/api/ai', createAiRoutes());
+// AI-сценарии: POST /api/ai/test (проверка связи с OpenAI) и
+// POST /api/ai/shop (сценарий «Собрать покупку»), см. ai.js. Доступ к базе
+// передаётся параметром — модулю нужен каталог товаров, а импортировать
+// server.js из него нельзя: файлы ссылались бы друг на друга.
+app.use('/api/ai', createAiRoutes({ query }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
