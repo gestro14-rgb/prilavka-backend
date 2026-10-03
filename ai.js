@@ -395,6 +395,84 @@ function buildBasket(modelItems, productById) {
   return { items, dropped, total };
 }
 
+/* ── Ужимание под бюджет без модели ──────────────────────────────────────
+   Два прохода модели снижают сумму, но не гарантируют попадания: gpt-4o-mini
+   считает ненадёжно и от запроса к запросу выдаёт разный результат. Поэтому
+   последнее слово за арифметикой, а не за моделью.
+
+   Работает только с тем, что модель уже выбрала: те же productId, те же
+   цены из базы. Новых товаров не появляется, цены не меняются, третьего
+   обращения к модели нет — иначе разброс вернулся бы вместе с ним.
+
+   Порядок от менее разрушительного к более: сначала количества, потом
+   позиции целиком. Внутри каждого шага первой страдает самая дорогая
+   строка — она и приближает к бюджету быстрее всего.
+
+   Разнообразие корзины бережётся на первом круге удаления: последнюю
+   позицию своей категории не трогаем, чтобы из «овощей и фруктов» не
+   осталось одних овощей. Если иначе в бюджет не попасть, второй круг снимает
+   и эту защиту: уложиться важнее, чем сохранить состав. */
+function fitToBudget(sourceItems, budget) {
+  const items = sourceItems.map((x) => ({ ...x, fromQuantity: x.quantity }));
+  const removed = [];
+  const total = () => items.reduce((sum, x) => sum + x.lineTotal, 0);
+
+  // Шаг 1: количества. По одной упаковке за раз, начиная с самой дорогой
+  // строки — пересчёт после каждого шага, чтобы не срезать лишнего.
+  while (total() > budget) {
+    const candidates = items.filter((x) => x.quantity > 1);
+    if (!candidates.length) break;
+    candidates.sort((a, b) => b.lineTotal - a.lineTotal || b.price - a.price);
+    const target = candidates[0];
+    target.quantity -= 1;
+    target.lineTotal = target.price * target.quantity;
+  }
+
+  // Шаг 2: позиции целиком. Первый круг щадит последнюю позицию каждой
+  // категории, второй — уже нет.
+  for (const keepDiversity of [true, false]) {
+    while (total() > budget && items.length > MIN_ITEMS_AFTER_FIT) {
+      const perCategory = new Map();
+      for (const x of items) perCategory.set(x.category, (perCategory.get(x.category) ?? 0) + 1);
+
+      const removable = keepDiversity
+        ? items.filter((x) => perCategory.get(x.category) > 1)
+        : items.slice();
+      if (!removable.length) break;
+
+      removable.sort((a, b) => b.lineTotal - a.lineTotal || b.price - a.price);
+      const victim = removable[0];
+      items.splice(items.indexOf(victim), 1);
+      removed.push({
+        productId: victim.productId,
+        title: victim.title,
+        price: victim.price,
+        quantity: victim.quantity,
+        lineTotal: victim.lineTotal,
+      });
+    }
+  }
+
+  // Урезанные количества считаем по тому, что осталось: позиция, которую
+  // сначала ужали, а потом удалили целиком, числится только в removed.
+  const reduced = items
+    .filter((x) => x.quantity < x.fromQuantity)
+    .map((x) => ({
+      productId: x.productId,
+      title: x.title,
+      price: x.price,
+      from: x.fromQuantity,
+      to: x.quantity,
+    }));
+
+  return {
+    items: items.map(({ fromQuantity, ...rest }) => rest),
+    total: total(),
+    removed,
+    reduced,
+  };
+}
+
 export function createAiRoutes({ query } = {}) {
   const router = express.Router();
 
@@ -554,13 +632,39 @@ export function createAiRoutes({ query } = {}) {
       }
     }
 
+    // ── Проход 3: арифметика вместо модели ────────────────────────────
+    //
+    // Если после обоих проходов корзина всё ещё не влезла, ужимаем её
+    // сами. Это не ещё один запрос к OpenAI, а чистый расчёт по уже
+    // выбранным товарам и их ценам из базы.
+    const aiTotal = basket.total;
+    let backendAdjustmentApplied = false;
+    let backendAdjustmentRemovedItems = [];
+    let backendAdjustmentReducedQuantities = [];
+
+    if (budget != null && basket.total > budget) {
+      const fitted = fitToBudget(basket.items, budget);
+      // Берём результат, только если он действительно дешевле: иначе
+      // отчитываться было бы не о чем.
+      if (fitted.total < basket.total) {
+        basket = { items: fitted.items, dropped: basket.dropped, total: fitted.total };
+        backendAdjustmentApplied = true;
+        backendAdjustmentRemovedItems = fitted.removed;
+        backendAdjustmentReducedQuantities = fitted.reduced;
+      }
+    }
+
     // ── Итог ──────────────────────────────────────────────────────────
     const overBy = budget != null ? Math.max(0, basket.total - budget) : 0;
     const budgetStatus = budget == null ? 'unknown' : (overBy > 0 ? 'over' : 'ok');
     const optimizationSucceeded = optimizationAttempted && overBy === 0;
 
-    // Когда уложиться не вышло, текст пишет backend, а не модель: модель
-    // не знает итоговой суммы и может пообещать то, чего нет.
+    // Текст про деньги пишет backend, а не модель: модель не знает
+    // итоговой суммы и легко пообещает то, чего нет.
+    if (budgetStatus === 'ok' && backendAdjustmentApplied) {
+      basketMessage = `Чтобы уложиться в ${budget} ₽, немного сократил корзину — `
+        + `получилось ${basket.total} ₽.`;
+    }
     if (budgetStatus === 'over') {
       basketMessage = `Собрал самую экономную корзину, но в ${budget} ₽ она не укладывается: `
         + `получилось ${basket.total} ₽, это на ${overBy} ₽ больше. `
@@ -572,9 +676,18 @@ export function createAiRoutes({ query } = {}) {
       model: first.response.model || OPENAI_MODEL,
       request: message,
       catalogSize: products.length,
+      // Сколько раз ходили к модели. Третьего обращения в этом сценарии
+      // нет и не будет: бюджет дожимается расчётом.
+      aiCalls: optimizationAttempted ? 2 : 1,
       optimizationAttempted,
       optimizationSucceeded,
       optimizationFromTotal: optimizationAttempted ? firstTotal : null,
+      // Итог после обоих проходов модели — до того, как за дело взялась
+      // арифметика.
+      aiTotal,
+      backendAdjustmentApplied,
+      backendAdjustmentRemovedItems,
+      backendAdjustmentReducedQuantities,
       result: {
         message: basketMessage,
         budget,
