@@ -19,6 +19,7 @@ import busboy from 'busboy';
 import { v2 as cloudinary } from 'cloudinary';
 import multer from 'multer';
 import { createPartnerRoutes } from './partners.js';
+import { createAiRoutes } from './ai.js';
 
 const app = express();
 app.use(cors());
@@ -92,6 +93,10 @@ const partnerModule = createPartnerRoutes({
 });
 app.use('/api/partner', partnerModule.router);
 app.use('/api/admin/partners', partnerModule.adminRouter);
+
+// Проверка связи с OpenAI — пока только POST /api/ai/test, см. ai.js.
+// Зависимостей у модуля нет: ни базы, ни авторизации он не трогает.
+app.use('/api/ai', createAiRoutes());
 
 const upload = multer({
   storage: multer.memoryStorage(),
