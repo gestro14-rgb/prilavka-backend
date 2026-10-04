@@ -20,10 +20,23 @@
 // передеплоивать после каждой правки переменной. Сам ключ никуда не
 // пишется и не возвращается — ни в лог, ни в ответ.
 import express from 'express';
-import OpenAI from 'openai';
+import multer from 'multer';
+import OpenAI, { toFile } from 'openai';
 
 // Модель задаётся переменной окружения, чтобы менять её без правки кода.
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+
+// Модель расшифровки голоса — отдельная от текстовой и тоже
+// переопределяемая переменной окружения.
+const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || 'whisper-1';
+
+// Запись голоса приходит в память и сразу уходит в OpenAI — на диск
+// её класть незачем. Потолок в 20 МБ с запасом покрывает минуту
+// речи и отсекает попытки залить сюда что-то другое.
+const audioUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 },
+});
 
 // Потолок на ответ модели: корзина — это десяток позиций, и длиннее
 // ответу быть незачем. Ограничение страхует от неожиданного счёта, если
@@ -48,6 +61,14 @@ const MAX_WEIGHT_CHARS = 42;
 // корзина перестаёт быть корзиной, и честнее вернуть «не уложились», чем
 // отдать одну морковку.
 const MIN_ITEMS_AFTER_FIT = 3;
+
+// Оговорка к запросам про самочувствие. Дописывается кодом, а не
+// доверяется модели: в проверке модель её то добавляла, то нет, а это
+// ровно та часть ответа, которая не должна зависеть от удачи. По той же
+// причине текст один и тот же — он не сочиняется заново каждый раз.
+const WELLNESS_DISCLAIMER = 'Это подбор продуктов, а не медицинская '
+  + 'рекомендация: при ограничениях или сохраняющихся симптомах лучше '
+  + 'ориентироваться на советы врача.';
 
 // Клиент создаётся один раз и переиспользуется: он держит пул соединений,
 // и собирать его на каждый запрос незачем. Пересоздаётся только если
@@ -118,7 +139,7 @@ function requireApiKey(res) {
 // products + categories, is_active = true. Порядок как в каталоге, чтобы
 // модель видела товары сгруппированными по категориям.
 const CATALOG_QUERY = `
-  SELECT p.id, p.title, p.price, p.weight, p.category, c.label AS category_label
+  SELECT p.id, p.title, p.price, p.weight, p.image_url, p.category, c.label AS category_label
   FROM products p
   LEFT JOIN categories c ON c.id = p.category
   WHERE p.is_active = true
@@ -140,11 +161,15 @@ function catalogBlock(products) {
   ].join('\n');
 }
 
-function itemRules(minItems) {
+function itemRules(minItems, maxItems = 8) {
   return [
-    `— items: от ${minItems} до 10 позиций. productId — строго из каталога выше.`,
-    '  quantity — целое число упаковок, от 1 до ' + MAX_ITEM_QUANTITY + '.',
-    '  reason — 2–5 слов, почему позиция в корзине.',
+    `— items: обычно от ${minItems} до ${maxItems} позиций. Больше — только если`,
+    '  человек прямо просит большую закупку (на неделю, на компанию, впрок).',
+    '  productId — строго из каталога выше.',
+    '— quantity — целое число упаковок, обычно 1. Две и больше — только когда это',
+    `  оправдано числом едоков, сроком или объёмом запроса; потолок ${MAX_ITEM_QUANTITY}.`,
+    '  Не клади ×3–×5 одного дорогого товара без явного основания.',
+    '— reason — 2–5 слов: чем позиция отвечает цели запроса.',
     '',
     'Запреты:',
     '— не выдумывай productId: любой идентификатор вне списка — ошибка;',
@@ -173,27 +198,95 @@ function cheapestBlock(products, perCategory = 5) {
   return ['Самые дешёвые товары по категориям:', ...lines].join('\n');
 }
 
-// ── Первый проход: обычный подбор ───────────────────────────────────────
+// ── Первый проход: понять запрос и подобрать ────────────────────────────
+//
+// Сценарий начинался как «собери корзину до N рублей», и промпт был про
+// бюджет. Но люди пишут иначе: «хочу что-нибудь сезонное», «побольше
+// клетчатки», «что взять на работу без готовки». Поэтому модель сперва
+// разбирает цель запроса, и только потом подбирает товары под неё.
+//
+// Отдельно оговорены запросы про самочувствие. Ассистент продуктового
+// магазина не врач: он может учесть контекст как пищевое предпочтение, но
+// не ставит диагнозов, ничего не лечит и не объявляет корзину медицински
+// безопасной. Жёстких фильтров «банан нельзя» в коде нет намеренно —
+// это была бы медицинская база, которой у нас нет и которую нельзя
+// подменять догадками.
 function buildShopInstructions(products) {
   return [
     'Ты — помощник сервиса доставки продуктов «Прилавка».',
-    'По фразе покупателя собери корзину ТОЛЬКО из товаров каталога ниже.',
+    'Покупатель пишет свободным текстом. Сначала пойми, чего он хочет,',
+    'и только потом подбирай товары из каталога.',
     '',
     catalogBlock(products),
     '',
-    'Правила:',
-    itemRules(4),
-    '— budget: бюджет в рублях целым числом, если он назван в запросе; иначе null.',
-    '— people: на скольких ЧЕЛОВЕК, целым числом, и только если в запросе сказано',
-    '  именно про людей («на двоих», «на одного», «на семью из четырёх»).',
-    '  Срок («на 3 дня», «на неделю») — это НЕ люди: тогда people = null,',
-    '  а срок уходит в preferences.',
-    '— preferences: короткие пожелания из запроса своими словами',
-    '  («больше фруктов», «без авокадо», «на 3 дня»). Если их нет — пустой массив.',
-    '— message: одно-два коротких дружелюбных предложения покупателю.',
+    '── Шаг 1. Разбери запрос ──',
+    '— intent — главная цель, одно значение:',
+    '  budget — главное уложиться в сумму;',
+    '  seasonal — хочет сезонное, свежее;',
+    '  nutrition — про состав рациона: клетчатка, витамины, углеводы, белок;',
+    '  wellness — самочувствие, состояние, ограничения по здоровью;',
+    '  taste — про вкус: вкусное, сладкое, освежающее, яркое;',
+    '  convenience — удобство: на перекус, с собой, без готовки;',
+    '  meal_planning — на приёмы пищи или на срок: завтраки, на три дня;',
+    '  general — ничего конкретного не названо.',
+    '  Если целей несколько — главную в intent, остальные в goals.',
+    '— goals — остальные цели короткими фразами своими словами',
+    '  («больше клетчатки», «сезонное», «на завтраки»). Нет — пустой массив.',
+    '— avoid — чего избегать («без авокадо», «не слишком сладкое»).',
+    '— preferences — прочие пожелания из запроса.',
+    '— budget — бюджет в рублях целым числом, если назван; иначе null.',
+    '— people — на скольких ЧЕЛОВЕК, и только если в запросе сказано именно',
+    '  про людей («на двоих», «на одного»). Срок («на 3 дня») — это НЕ люди:',
+    '  тогда people = null, а срок уходит в goals.',
+    '',
+    '── Шаг 2. Подбери товары под эту цель ──',
+    'Опирайся на то, что реально известно о товаре: категорию, название,',
+    'размер упаковки и цену. Ничего другого о товарах ты не знаешь.',
+    '',
+    '— клетчатка, «побольше овощей»: овощи и зелень в основе, фрукты дополняют;',
+    '— углеводы, сытность: корнеплоды, картофель, более сытные фрукты;',
+    '— витамин C, «освежающее»: цитрусовые, ягоды, болгарский перец, зелень;',
+    '— перекус, «с собой», «без готовки»: то, что едят как есть и удобно',
+    '  взять с собой — фрукты, томаты черри, молодая морковь;',
+    '— завтраки: фрукты и ягоды, зелень к омлету;',
+    '— «лёгкое», «нейтральное»: простые овощи и некислые фрукты, без',
+    '  острого, пряного и тяжёлых сочетаний;',
+    '— «сладкое, но не тяжёлое»: сладкие фрукты и ягоды небольшими упаковками.',
+    '',
+    'Про сезонность: признака сезона в каталоге нет, и выдумывать его нельзя.',
+    'Не утверждай, что конкретный товар «сейчас в сезоне». Подбирай свежие',
+    'овощи, фрукты и зелень и пиши мягко — «подходят под сезонный формат».',
+    '',
+    '── Запросы про самочувствие (intent: wellness) ──',
+    'Ты ассистент продуктового магазина, а не врач. Это правило действует',
+    'и в message, и в reason у каждой позиции.',
+    '',
+    'НЕЛЬЗЯ писать ничего в таком роде:',
+    '  «поможет поддержать уровень сахара», «нормализует давление»,',
+    '  «восстановит желудок», «улучшает пищеварение», «полезно при диабете»,',
+    '  «эта корзина подходит при вашем состоянии», «снимет симптомы».',
+    'То есть: никаких диагнозов, никакого влияния продукта на болезнь или',
+    'показатели организма, никаких обещаний улучшения самочувствия.',
+    '',
+    'МОЖНО говорить только о самих продуктах и их составе:',
+    '  «сделал упор на овощи и менее сладкие фрукты»,',
+    '  «подобрал более нейтральные и простые продукты»,',
+    '  «в корзине больше овощей и зелени».',
+    'reason у позиции тоже описывает продукт («некислый фрукт», «простой',
+    'овощ»), а не его действие на человека.',
+    '',
+    '── Шаг 3. Напиши message ──',
+    'Одно-два предложения о том, ПОЧЕМУ выбраны эти продукты, а не формальное',
+    '«вот ваша корзина». Например: «Сделал упор на овощи и зелень — они',
+    'добавят больше клетчатки». Без цен и без сумм.',
+    '',
+    'Правила состава:',
+    itemRules(4, 8),
     '',
     'Если бюджет назван — старайся уложиться в него по ценам из каталога,',
     'но никогда не подменяй и не пересчитывай сами цены.',
+    'Если бюджета нет — собери разумную корзину под цель, а не максимально',
+    'большую.',
   ].join('\n');
 }
 
@@ -201,7 +294,7 @@ function buildShopInstructions(products) {
 //
 // Модели показывают её же корзину, но уже с нашими ценами и нашим итогом:
 // без этого она «чинит» воображаемую сумму, которую посчитала сама.
-function buildFitInstructions(products, { request, budget, basket }) {
+function buildFitInstructions(products, { request, budget, basket, parsed }) {
   const lines = basket.items.map(
     (x) => `${x.productId} | ${x.title} | ${x.price} ₽ x ${x.quantity} = ${x.lineTotal} ₽`,
   );
@@ -210,6 +303,8 @@ function buildFitInstructions(products, { request, budget, basket }) {
     'Корзина, которую ты собрал, не укладывается в бюджет покупателя.',
     '',
     `Запрос покупателя: «${request}»`,
+    `Цель запроса: ${parsed.intent || 'general'}`      + (parsed.goals?.length ? `, также: ${parsed.goals.join(', ')}` : '')
+      + (parsed.avoid?.length ? `. Избегать: ${parsed.avoid.join(', ')}` : ''),
     `Бюджет: ${budget} ₽`,
     '',
     'Текущая корзина (цены сервиса, не твои):',
@@ -230,11 +325,12 @@ function buildFitInstructions(products, { request, budget, basket }) {
     '',
     'Перед ответом сложи цены выбранных позиций и убедись, что сумма помещается',
     `в ${budget} ₽. Если не помещается — бери позиции из списка самых дешёвых выше.`,
-    'Смысл запроса сохраняй: если просили овощи и фрукты — оставь и то и другое,',
-    'если просили без какого-то продукта — его быть не должно.',
+    'Смысл запроса сохраняй: цель выше должна остаться выполненной.',
+    'Если просили овощи и фрукты — оставь и то и другое, если просили без',
+    'какого-то продукта — его быть не должно.',
     '',
     'Правила:',
-    itemRules(MIN_ITEMS_AFTER_FIT),
+    itemRules(MIN_ITEMS_AFTER_FIT, 8),
     '— message: одно короткое предложение о том, что корзину ужали. Без цифр и цен.',
     '',
     `Если уложиться в ${budget} ₽ невозможно даже минимальной корзиной —`,
@@ -264,11 +360,31 @@ function buildBasketItemsSchema(productIds) {
   };
 }
 
+const SHOP_INTENTS = [
+  'budget', 'seasonal', 'nutrition', 'wellness',
+  'taste', 'convenience', 'meal_planning', 'general',
+];
+
 function buildShopSchema(productIds) {
   return {
     type: 'object',
     properties: {
-      message: { type: 'string', description: 'Короткое сообщение покупателю, без цен' },
+      message: { type: 'string', description: 'Чем выбор отвечает запросу, без цен' },
+      intent: {
+        type: 'string',
+        enum: SHOP_INTENTS,
+        description: 'Главная цель запроса',
+      },
+      goals: {
+        type: 'array',
+        description: 'Остальные цели запроса',
+        items: { type: 'string' },
+      },
+      avoid: {
+        type: 'array',
+        description: 'Чего избегать',
+        items: { type: 'string' },
+      },
       budget: { type: ['integer', 'null'], description: 'Бюджет в рублях или null' },
       people: { type: ['integer', 'null'], description: 'Число едоков или null' },
       preferences: {
@@ -278,7 +394,7 @@ function buildShopSchema(productIds) {
       },
       items: buildBasketItemsSchema(productIds),
     },
-    required: ['message', 'budget', 'people', 'preferences', 'items'],
+    required: ['message', 'intent', 'goals', 'avoid', 'budget', 'people', 'preferences', 'items'],
     additionalProperties: false,
   };
 }
@@ -380,6 +496,7 @@ function buildBasket(modelItems, productById) {
     items.push({
       productId: product.id,
       title: product.title,
+      imageUrl: product.image_url || null,
       // Цена — из базы. То, что модель могла бы сказать о цене, не
       // участвует в расчёте вообще.
       price: product.price,
@@ -473,6 +590,40 @@ function fitToBudget(sourceItems, budget) {
   };
 }
 
+/* ── Потоковый ответ ─────────────────────────────────────────────────────
+   Подбор занимает несколько секунд, и всё это время человек смотрел в
+   пустоту: ответ приходил целиком и сразу. Поэтому рядом с /shop есть
+   /chat/stream — та же логика, но отданная по мере готовности.
+
+   Что именно стримится: первый проход модели идёт с stream: true, и его
+   текстовые дельты приходят к нам по кускам. Схема ответа — JSON, поэтому
+   наружу мы отдаём не сырые куски, а только растущее поле message:
+   человеку нужен текст, а не разметка. Это настоящие дельты модели, а не
+   побуквенная анимация на клиенте.
+
+   Структурированная часть (корзина, суммы, флаги бюджета) уходит одним
+   событием в конце: её нельзя показывать по частям — пока не отработали
+   проверка бюджета и пересчёт по базе, любые числа были бы неверными. */
+
+// Достаёт из частично пришедшего JSON содержимое поля message. Полноценный
+// потоковый парсер здесь не нужен: поле строковое и идёт первым, а всё,
+// что после закрывающей кавычки, нас не касается.
+function partialMessage(buffer) {
+  const m = /"message"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(buffer);
+  if (!m) return null;
+  try {
+    // Достраиваем кавычку, чтобы отдать JSON.parse корректную строку и
+    // получить уже раскодированные \n и \".
+    return JSON.parse(`"${m[1]}"`);
+  } catch {
+    return null;
+  }
+}
+
+function sse(res, event, data) {
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
 export function createAiRoutes({ query } = {}) {
   const router = express.Router();
 
@@ -537,6 +688,8 @@ export function createAiRoutes({ query } = {}) {
     if (!apiKey) return undefined;
 
     const message = raw.trim();
+    const image = req.body?.image && typeof req.body.image.dataUrl === 'string'
+      && req.body.image.dataUrl.length <= 12_000_000 ? req.body.image : null;
     const startedAt = Date.now();
     const client = getClient(apiKey);
 
@@ -565,8 +718,8 @@ export function createAiRoutes({ query } = {}) {
 
     // ── Проход 1: подбор ──────────────────────────────────────────────
     const first = await runPass(client, {
-      instructions: buildShopInstructions(products),
-      input: message,
+      instructions: buildShopInstructions(products) + (image ? `\n\n${IMAGE_SHOP_INSTRUCTIONS}` : ''),
+      input: imageAwareInput(message, image),
       schema: buildShopSchema(productIds),
       schemaName: 'shop_basket',
     });
@@ -605,7 +758,9 @@ export function createAiRoutes({ query } = {}) {
       optimizationAttempted = true;
 
       const second = await runPass(client, {
-        instructions: buildFitInstructions(products, { request: message, budget, basket }),
+        instructions: buildFitInstructions(products, {
+          request: message, budget, basket, parsed: first.parsed,
+        }),
         input: message,
         schema: buildFitSchema(productIds),
         schemaName: 'shop_basket_fit',
@@ -659,6 +814,13 @@ export function createAiRoutes({ query } = {}) {
     const budgetStatus = budget == null ? 'unknown' : (overBy > 0 ? 'over' : 'ok');
     const optimizationSucceeded = optimizationAttempted && overBy === 0;
 
+    // К запросам про самочувствие оговорка добавляется всегда. Если модель
+    // написала её сама — второй раз не дублируем.
+    const intent = SHOP_INTENTS.includes(first.parsed.intent) ? first.parsed.intent : 'general';
+    if (intent === 'wellness' && !/врач/i.test(basketMessage)) {
+      basketMessage = `${basketMessage.trim()} ${WELLNESS_DISCLAIMER}`.trim();
+    }
+
     // Текст про деньги пишет backend, а не модель: модель не знает
     // итоговой суммы и легко пообещает то, чего нет.
     if (budgetStatus === 'ok' && backendAdjustmentApplied) {
@@ -690,6 +852,12 @@ export function createAiRoutes({ query } = {}) {
       backendAdjustmentReducedQuantities,
       result: {
         message: basketMessage,
+        // Как сценарий понял запрос. Нужно не только для отладки:
+        // следующий шаг (подбор замен, уточняющий вопрос) будет
+        // опираться именно на цель, а не на исходную фразу.
+        intent,
+        goals: Array.isArray(first.parsed.goals) ? first.parsed.goals : [],
+        avoid: Array.isArray(first.parsed.avoid) ? first.parsed.avoid : [],
         budget,
         people: Number.isInteger(first.parsed.people) ? first.parsed.people : null,
         preferences: Array.isArray(first.parsed.preferences) ? first.parsed.preferences : [],
@@ -711,5 +879,257 @@ export function createAiRoutes({ query } = {}) {
     });
   });
 
+  /* POST /api/ai/chat/stream — тот же сценарий, что /shop, но по частям.
+     Сначала статусы, потом живой текст ответа, в конце — собранный
+     результат. /shop остаётся как есть: им пользуются те, кому поток не
+     нужен. */
+  router.post('/chat/stream', async (req, res) => {
+    const raw = req.body?.message;
+    if (typeof raw !== 'string' || !raw.trim() || raw.length > MAX_MESSAGE_LENGTH) {
+      return res.status(400).json({ ok: false, reason: 'bad_request', error: 'Нужно поле message.' });
+    }
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return res.status(503).json({ ok: false, reason: 'missing_api_key', error: 'OPENAI_API_KEY не задан.' });
+    }
+
+    const message = raw.trim();
+    const image = req.body?.image && typeof req.body.image.dataUrl === 'string'
+      && req.body.image.dataUrl.length <= 12_000_000 ? req.body.image : null;
+    const startedAt = Date.now();
+    const client = getClient(apiKey);
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      // Прокси Railway иначе копит ответ в буфере, и поток перестаёт быть
+      // потоком.
+      'X-Accel-Buffering': 'no',
+    });
+
+    const fail = (reason, error) => {
+      sse(res, 'error', { reason, error });
+      sse(res, 'done', { tookMs: Date.now() - startedAt });
+      res.end();
+    };
+
+    try {
+      sse(res, 'stage', { stage: 'thinking' });
+
+      const catalog = await query(CATALOG_QUERY);
+      const products = catalog.rows;
+      if (!products.length) return fail('catalog_empty', 'В каталоге нет активных товаров.');
+
+      const productById = new Map(products.map((x) => [x.id, x]));
+      const productIds = products.map((x) => x.id);
+
+      sse(res, 'stage', { stage: 'picking' });
+
+      // ── Проход 1, потоком ──────────────────────────────────────────
+      const stream = await client.responses.create({
+        model: OPENAI_MODEL,
+        instructions: buildShopInstructions(products) + (image ? `\n\n${IMAGE_SHOP_INSTRUCTIONS}` : ''),
+        input: imageAwareInput(message, image),
+        max_output_tokens: SHOP_MAX_OUTPUT_TOKENS,
+        text: {
+          format: {
+            type: 'json_schema', name: 'shop_basket', strict: true,
+            schema: buildShopSchema(productIds),
+          },
+        },
+        stream: true,
+      });
+
+      let buffer = '';
+      let sent = '';
+      let final = null;
+
+      for await (const event of stream) {
+        if (event.type === 'response.output_text.delta') {
+          buffer += event.delta ?? '';
+          const text = partialMessage(buffer);
+          if (text && text.length > sent.length) {
+            sse(res, 'delta', { text: text.slice(sent.length) });
+            sent = text;
+          }
+        } else if (event.type === 'response.completed') {
+          final = event.response;
+        } else if (event.type === 'error' || event.type === 'response.failed') {
+          return fail('openai_error', 'Модель прервала ответ.');
+        }
+      }
+
+      if (!final) return fail('incomplete_response', 'Модель не завершила ответ.');
+
+      let parsed;
+      try {
+        parsed = JSON.parse(final.output_text ?? buffer);
+      } catch {
+        return fail('bad_model_json', 'Ответ модели не разобрался.');
+      }
+      if (!Array.isArray(parsed.items)) return fail('bad_model_json', 'В ответе нет позиций.');
+
+      sse(res, 'stage', { stage: 'pricing' });
+
+      // ── Деньги и бюджет — как в /shop, тем же кодом ────────────────
+      let basket = buildBasket(parsed.items, productById);
+      if (!basket.items.length) return fail('no_valid_items', 'Товары не нашлись в каталоге.');
+
+      const budget = Number.isInteger(parsed.budget) ? parsed.budget : null;
+      const firstTotal = basket.total;
+      let basketMessage = typeof parsed.message === 'string' ? parsed.message : '';
+      let optimizationAttempted = false;
+      let secondUsage = null;
+
+      if (budget != null && basket.total > budget) {
+        optimizationAttempted = true;
+        const second = await runPass(client, {
+          instructions: buildFitInstructions(products, {
+            request: message, budget, basket, parsed,
+          }),
+          input: message,
+          schema: buildFitSchema(productIds),
+          schemaName: 'shop_basket_fit',
+        });
+        secondUsage = second.response?.usage ?? null;
+        if (!second.failure) {
+          const retry = buildBasket(second.parsed.items, productById);
+          const better = retry.items.length >= Math.min(MIN_ITEMS_AFTER_FIT, basket.items.length)
+            && (retry.total <= budget || retry.total < basket.total);
+          if (better) {
+            basket = retry;
+            if (second.parsed.message) basketMessage = second.parsed.message;
+          }
+        }
+      }
+
+      const aiTotal = basket.total;
+      let backendAdjustmentApplied = false;
+      let backendAdjustmentRemovedItems = [];
+      let backendAdjustmentReducedQuantities = [];
+      if (budget != null && basket.total > budget) {
+        const fitted = fitToBudget(basket.items, budget);
+        if (fitted.total < basket.total) {
+          basket = { items: fitted.items, dropped: basket.dropped, total: fitted.total };
+          backendAdjustmentApplied = true;
+          backendAdjustmentRemovedItems = fitted.removed;
+          backendAdjustmentReducedQuantities = fitted.reduced;
+        }
+      }
+
+      const overBy = budget != null ? Math.max(0, basket.total - budget) : 0;
+      const budgetStatus = budget == null ? 'unknown' : (overBy > 0 ? 'over' : 'ok');
+      const intent = SHOP_INTENTS.includes(parsed.intent) ? parsed.intent : 'general';
+
+      if (intent === 'wellness' && !/врач/i.test(basketMessage)) {
+        basketMessage = `${basketMessage.trim()} ${WELLNESS_DISCLAIMER}`.trim();
+      }
+      if (budgetStatus === 'ok' && backendAdjustmentApplied) {
+        basketMessage = `Чтобы уложиться в ${budget} ₽, немного сократил корзину — `
+          + `получилось ${basket.total} ₽.`;
+      }
+      if (budgetStatus === 'over') {
+        basketMessage = `Собрал самую экономную корзину, но в ${budget} ₽ она не укладывается: `
+          + `получилось ${basket.total} ₽, это на ${overBy} ₽ больше. `
+          + 'Можно убрать часть позиций или увеличить бюджет.';
+      }
+
+      // Текст мог измениться после пересчёта — отдаём итоговый целиком,
+      // клиент заменит им то, что успел показать потоком.
+      sse(res, 'result', {
+        ok: true,
+        model: final.model || OPENAI_MODEL,
+        request: message,
+        catalogSize: products.length,
+        aiCalls: optimizationAttempted ? 2 : 1,
+        optimizationAttempted,
+        optimizationSucceeded: optimizationAttempted && overBy === 0,
+        optimizationFromTotal: optimizationAttempted ? firstTotal : null,
+        aiTotal,
+        backendAdjustmentApplied,
+        backendAdjustmentRemovedItems,
+        backendAdjustmentReducedQuantities,
+        result: {
+          message: basketMessage,
+          intent,
+          goals: Array.isArray(parsed.goals) ? parsed.goals : [],
+          avoid: Array.isArray(parsed.avoid) ? parsed.avoid : [],
+          budget,
+          people: Number.isInteger(parsed.people) ? parsed.people : null,
+          preferences: Array.isArray(parsed.preferences) ? parsed.preferences : [],
+          items: basket.items,
+          total: basket.total,
+          budgetStatus,
+          withinBudget: budget == null ? null : overBy === 0,
+          overBy,
+          dropped: basket.dropped,
+        },
+        usage: {
+          first: final.usage ?? null,
+          second: secondUsage,
+          totalTokens: (final.usage?.total_tokens ?? 0) + (secondUsage?.total_tokens ?? 0),
+        },
+        tookMs: Date.now() - startedAt,
+      });
+      sse(res, 'done', { tookMs: Date.now() - startedAt });
+      return res.end();
+    } catch (err) {
+      console.error('[ai] stream:', scrubKeys(err?.message ?? err));
+      return fail('openai_error', 'Не удалось получить ответ.');
+    }
+  });
+
+  /* POST /api/ai/transcribe — расшифровка надиктованного.
+     Голос записывает сам чат и присылает сюда готовый файл; ключ, как и
+     везде, остаётся на сервере. */
+  router.post('/transcribe', audioUpload.single('audio'), async (req, res) => {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return res.status(503).json({ ok: false, reason: 'missing_api_key', error: 'OPENAI_API_KEY не задан.' });
+    }
+    if (!req.file?.buffer?.length) {
+      return res.status(400).json({ ok: false, reason: 'bad_request', error: 'Нужен файл audio.' });
+    }
+
+    const startedAt = Date.now();
+    try {
+      const file = await toFile(
+        req.file.buffer,
+        req.file.originalname || 'voice.webm',
+        { type: req.file.mimetype || 'audio/webm' },
+      );
+      const out = await getClient(apiKey).audio.transcriptions.create({
+        file,
+        model: OPENAI_TRANSCRIBE_MODEL,
+        language: 'ru',
+      });
+      return res.json({ ok: true, text: out.text ?? '', tookMs: Date.now() - startedAt });
+    } catch (err) {
+      const msg = scrubKeys(err?.message ?? 'Не удалось расшифровать запись');
+      console.error('[ai] transcribe:', err?.status ?? '', msg);
+      return res.status(502).json({ ok: false, reason: 'transcribe_error', error: msg });
+    }
+  });
+
   return router;
 }
+
+function imageAwareInput(message, image) {
+  if (!image?.dataUrl || typeof image.dataUrl !== 'string') return message;
+  const mimeType = typeof image.mimeType === 'string' && image.mimeType.startsWith('image/')
+    ? image.mimeType : 'image/jpeg';
+  return [{
+    role: 'user',
+    content: [
+      { type: 'input_text', text: message },
+      { type: 'input_image', image_url: image.dataUrl, detail: 'low' },
+    ],
+  }];
+}
+
+const IMAGE_SHOP_INSTRUCTIONS = `Если приложено изображение, сначала перечисли только продукты, которые уверенно видны.
+Для неразличимых объектов используй осторожную формулировку «Не уверен, что это …» и не добавляй такой продукт в корзину.
+Если запрос просит приготовить блюдо, выбери ингредиенты именно этого блюда из переданного каталога.
+Для рататуя приоритет: баклажан, кабачок/цукини, сладкий перец, помидоры, лук, зелень/базилик.
+Не добавляй случайные товары ради количества. Если ингредиента нет в каталоге, упомяни это в message и используй только доступные реальные товары.`;

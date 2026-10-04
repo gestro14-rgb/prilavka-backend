@@ -772,7 +772,7 @@ async function upsertUser(telegramId, username, firstName) {
 
 // Отправляет сообщение в произвольный Telegram-чат через Bot API.
 async function sendTelegramMessageToChat(chatId, text) {
-  if (!TELEGRAM_BOT_TOKEN || !chatId) return;
+  if (!TELEGRAM_BOT_TOKEN || !chatId) return false;
   try {
     const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
@@ -782,9 +782,12 @@ async function sendTelegramMessageToChat(chatId, text) {
     if (!res.ok) {
       const body = await res.text();
       console.error('Telegram sendMessage failed:', res.status, body);
+      return false;
     }
+    return true;
   } catch (e) {
     console.error('Telegram sendMessage error:', e);
+    return false;
   }
 }
 
@@ -4229,6 +4232,38 @@ app.get('/api/admin/users', requireAuth, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Рассылки Telegram. Получатели берутся только из users с числовым telegram_id;
+// отправка подтверждается фронтендом и идёт последовательно, чтобы не упереться
+// в лимиты Bot API. Ошибка одного чата не прерывает остальные.
+app.post('/api/admin/broadcast', requireAuth, async (req, res) => {
+  const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+  const requestedIds = Array.isArray(req.body?.telegramIds) ? req.body.telegramIds : null;
+  if (req.body?.confirm !== true) return res.status(400).json({ error: 'Требуется явное подтверждение отправки' });
+  if (!text || text.length > 4096) return res.status(400).json({ error: 'Текст должен быть от 1 до 4096 символов' });
+  try {
+    const params = [];
+    let where = 'WHERE u.telegram_id IS NOT NULL';
+    if (requestedIds) {
+      const ids = requestedIds.map((id) => String(id)).filter((id) => /^\d+$/.test(id)).slice(0, 5000);
+      if (!ids.length) return res.status(400).json({ error: 'Выберите хотя бы одного получателя' });
+      params.push(ids);
+      where += ' AND u.telegram_id = ANY($1::bigint[])';
+    }
+    const recipients = await query(`SELECT telegram_id, first_name, username FROM users u ${where} ORDER BY u.telegram_id`, params);
+    let sent = 0;
+    let failed = 0;
+    for (const recipient of recipients.rows) {
+      if (await sendTelegramMessageToChat(recipient.telegram_id, text)) sent += 1;
+      else failed += 1;
+      await new Promise((resolve) => setTimeout(resolve, 55));
+    }
+    res.json({ total: recipients.rows.length, sent, failed });
+  } catch (e) {
+    console.error('Admin broadcast failed:', e);
+    res.status(500).json({ error: 'Не удалось выполнить рассылку' });
   }
 });
 
