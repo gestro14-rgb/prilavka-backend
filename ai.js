@@ -22,6 +22,7 @@
 import express from 'express';
 import multer from 'multer';
 import OpenAI, { toFile } from 'openai';
+import { randomUUID } from 'node:crypto';
 
 // Модель задаётся переменной окружения, чтобы менять её без правки кода.
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
@@ -78,7 +79,7 @@ let cachedKey = null;
 
 function getClient(apiKey) {
   if (!cachedClient || cachedKey !== apiKey) {
-    cachedClient = new OpenAI({ apiKey });
+    cachedClient = new OpenAI({ apiKey, timeout: 60_000, maxRetries: 1 });
     cachedKey = apiKey;
   }
   return cachedClient;
@@ -879,6 +880,76 @@ export function createAiRoutes({ query } = {}) {
     });
   });
 
+  // Unified assistant route. A lightweight structured pass decides whether
+  // the user needs advice, a recipe, nutrition guidance, photo analysis or
+  // shopping. Only the shopping branch loads the full catalogue and invokes
+  // the existing validated basket skill.
+  router.post('/chat', async (req, res) => {
+    const requestId = randomUUID();
+    const logMeta = () => ({ requestId, durationMs: Date.now() - startedAt });
+    const raw = req.body?.message;
+    if (typeof raw !== 'string' || !raw.trim()) return res.status(400).json({ ok: false, reason: 'bad_request', error: 'Нужно поле message.' });
+    if (raw.length > MAX_MESSAGE_LENGTH) return res.status(400).json({ ok: false, reason: 'message_too_long', error: `Запрос длиннее ${MAX_MESSAGE_LENGTH} символов.` });
+    const apiKey = requireApiKey(res);
+    if (!apiKey) return undefined;
+    const image = req.body?.image && typeof req.body.image.dataUrl === 'string' && req.body.image.dataUrl.length <= 12_000_000 ? req.body.image : null;
+    const conversation = Array.isArray(req.body?.conversation) ? req.body.conversation.slice(-8) : [];
+    const startedAt = Date.now();
+    const client = getClient(apiKey);
+    let first;
+    try {
+      first = await runPass(client, {
+        instructions: buildAssistantInstructions({ conversation }),
+        input: imageAwareInput(raw.trim(), image),
+        schema: assistantSchema,
+        schemaName: 'assistant_intent',
+      });
+    } catch (err) {
+      return res.status(502).json({ ok: false, reason: 'openai_error', error: scrubKeys(err?.message || 'Не удалось получить ответ.'), tookMs: Date.now() - startedAt });
+    }
+    if (first.failure) {
+      console.error('[ai/chat] first pass failed', { ...logMeta(), reason: first.failure.reason, status: first.failure.status, imageBytes: image?.dataUrl?.length || 0 });
+      return res.status(502).json({ ok: false, requestId, ...first.failure, tookMs: Date.now() - startedAt });
+    }
+    const parsed = first.parsed;
+    if (parsed.type !== 'shopping') {
+      return res.json({
+        ok: true, model: first.response.model || OPENAI_MODEL, aiCalls: 1,
+        usage: { first: first.response.usage || null, second: null, totalTokens: first.response.usage?.total_tokens || 0 },
+        requestId, tookMs: Date.now() - startedAt,
+        result: {
+          type: parsed.type, intent: parsed.intent, message: parsed.message,
+          recipe: { title: parsed.recipeTitle, description: parsed.recipeDescription, minutes: parsed.recipeMinutes, ingredients: parsed.recipeIngredients, steps: parsed.recipeSteps },
+          nutrition: parsed.nutrition, seenProducts: parsed.seenProducts, detectedItems: parsed.detectedItems, items: [], total: 0, budget: null,
+        },
+      });
+    }
+
+    let products;
+    try { products = (await query(CATALOG_QUERY)).rows; } catch (err) {
+      return res.status(503).json({ ok: false, reason: 'catalog_unavailable', error: 'Не удалось прочитать каталог.', tookMs: Date.now() - startedAt });
+    }
+    if (!products.length) return res.status(503).json({ ok: false, reason: 'catalog_empty', error: 'В каталоге нет активных товаров.', tookMs: Date.now() - startedAt });
+    const productById = new Map(products.map((p) => [p.id, p]));
+    const productIds = products.map((p) => p.id);
+    const shop = await runPass(client, {
+      instructions: `${buildShopInstructions(products)}\n\nЭто подтверждённый shopping-запрос. Сохрани смысл исходного запроса и контекст: ${raw.trim()}\n${conversation.map((x) => `${x.role}: ${x.content}`).join('\n')}`,
+      input: imageAwareInput(raw.trim(), image), schema: buildShopSchema(productIds), schemaName: 'assistant_shopping',
+    });
+    if (shop.failure) {
+      console.error('[ai/chat] shopping pass failed', { ...logMeta(), reason: shop.failure.reason, status: shop.failure.status });
+      return res.status(502).json({ ok: false, requestId, ...shop.failure, tookMs: Date.now() - startedAt });
+    }
+    const basket = buildBasket(shop.parsed.items, productById);
+    const budget = Number.isInteger(shop.parsed.budget) ? shop.parsed.budget : null;
+    return res.json({
+      ok: true, model: shop.response.model || OPENAI_MODEL, aiCalls: 2,
+      usage: { first: first.response.usage || null, second: shop.response.usage || null, totalTokens: (first.response.usage?.total_tokens || 0) + (shop.response.usage?.total_tokens || 0) },
+      requestId, tookMs: Date.now() - startedAt,
+      result: { type: 'shopping', intent: shop.parsed.intent, message: shop.parsed.message, items: basket.items, total: basket.total, budget, withinBudget: budget == null ? null : basket.total <= budget, overBy: budget == null ? 0 : Math.max(0, basket.total - budget), dropped: basket.dropped, recipe: null, nutrition: [], seenProducts: [] },
+    });
+  });
+
   /* POST /api/ai/chat/stream — тот же сценарий, что /shop, но по частям.
      Сначала статусы, потом живой текст ответа, в конце — собранный
      результат. /shop остаётся как есть: им пользуются те, кому поток не
@@ -1113,6 +1184,46 @@ export function createAiRoutes({ query } = {}) {
   });
 
   return router;
+}
+
+const ASSISTANT_TYPES = ['text', 'recipe', 'nutrition', 'shopping', 'photo', 'vision'];
+const assistantSchema = {
+  type: 'object',
+  properties: {
+    type: { type: 'string', enum: ASSISTANT_TYPES },
+    intent: { type: 'string' },
+    message: { type: 'string' },
+    recipeTitle: { type: 'string' },
+    recipeDescription: { type: 'string' },
+    recipeMinutes: { type: 'integer' },
+    recipeIngredients: { type: 'array', items: { type: 'string' } },
+    recipeSteps: { type: 'array', items: { type: 'string' } },
+    nutrition: { type: 'array', items: { type: 'string' } },
+    seenProducts: { type: 'array', items: { type: 'string' } },
+    detectedItems: { type: 'array', items: { type: 'string' } },
+    items: { type: 'array', items: { type: 'object', properties: {
+      productId: { type: 'string' }, quantity: { type: 'integer' }, reason: { type: 'string' },
+    }, required: ['productId', 'quantity', 'reason'], additionalProperties: false } },
+    budget: { type: ['integer', 'null'] },
+  },
+  required: ['type', 'intent', 'message', 'recipeTitle', 'recipeDescription', 'recipeMinutes', 'recipeIngredients', 'recipeSteps', 'nutrition', 'seenProducts', 'detectedItems', 'items', 'budget'],
+  additionalProperties: false,
+};
+
+function buildAssistantInstructions({ catalog = '', conversation = [] } = {}) {
+  return [
+    'Ты — полноценный продуктовый AI-ассистент «Прилавки», отвечай по-русски.',
+    'Сначала определи намерение: text, recipe, nutrition, shopping или photo.',
+    'Не создавай корзину для обычного вопроса, совета, рецепта или сравнения.',
+    'Корзина нужна только при явной просьбе собрать, купить, подобрать, что докупить.',
+    'Рецепт должен быть компактным: название, описание, время, продукты, 3–6 шагов.',
+    'Для фото используй type=vision для запроса «изучи/что здесь», а для «что приготовить» — type=recipe. Перечисляй только уверенно видимые продукты в detectedItems; сомнительное отмечай «Не уверен, что это …».',
+    'Питательные значения называй приблизительными, если в данных нет точной записи товара.',
+    'При заболеваниях и аллергиях дай полезную общую информацию и коротко напомни, что врач учитывает индивидуальные ограничения.',
+    catalog ? `Для подбора покупок используй только этот реальный каталог:\n${catalog}` : '',
+    conversation.length ? `Контекст последних сообщений:\n${conversation.map((x) => `${x.role}: ${x.content}`).join('\n')}` : '',
+    'Верни все поля схемы. Для неприменимых полей используй пустую строку, [] или null.',
+  ].filter(Boolean).join('\n\n');
 }
 
 function imageAwareInput(message, image) {
