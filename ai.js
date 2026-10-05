@@ -24,6 +24,7 @@ import multer from 'multer';
 import OpenAI, { toFile } from 'openai';
 import { randomUUID } from 'node:crypto';
 import { findMealDbRecipes, normalizeFood } from './mealRecipes.js';
+import { dishIngredientMatchesName, getStableDishPlan, isExplicitDishShoppingRequest, matchDishIngredients } from './dishShopping.js';
 
 // Модель задаётся переменной окружения, чтобы менять её без правки кода.
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
@@ -60,6 +61,20 @@ const recipePlanSchema = {
     dishSearch: { type: 'string' },
     fallback: { type: 'string' },
   }, required: ['ingredientEnglish', 'dishSearch', 'fallback'], additionalProperties: false,
+};
+
+const dishPlanSchema = {
+  type: 'object',
+  properties: {
+    dishName: { type: 'string' },
+    ingredients: { type: 'array', items: { type: 'object', properties: {
+      canonical: { type: 'string' }, aliases: { type: 'array', items: { type: 'string' } }, required: { type: 'boolean' },
+    }, required: ['canonical', 'aliases', 'required'], additionalProperties: false } },
+    excluded: { type: 'array', items: { type: 'string' } },
+    budget: { type: ['integer', 'null'] },
+  },
+  required: ['dishName', 'ingredients', 'excluded', 'budget'],
+  additionalProperties: false,
 };
 
 function recipeCatalogSchema(productIds) {
@@ -166,7 +181,7 @@ function requireApiKey(res) {
 // products + categories, is_active = true. Порядок как в каталоге, чтобы
 // модель видела товары сгруппированными по категориям.
 const CATALOG_QUERY = `
-  SELECT p.id, p.title, p.price, p.weight, p.image_url, p.category, c.label AS category_label
+  SELECT p.id, p.title, p.price, p.weight, p.image_url, p.category, p.composition, p.is_bundle, c.label AS category_label
   FROM products p
   LEFT JOIN categories c ON c.id = p.category
   WHERE p.is_active = true
@@ -190,7 +205,7 @@ async function loadAiCatalog(query) {
       const categories = new Map((catalog.categories || []).map((c) => [String(c.id), c.label]));
       return { rows: catalog.products.filter((p) => p.isActive !== false).map((p) => ({
         id: String(p.id), title: p.title, price: Number(p.price), weight: p.weight,
-        image_url: p.imageUrl || null, category: p.category,
+        image_url: p.imageUrl || null, composition: p.composition || [], is_bundle: p.isBundle === true, category: p.category,
         category_label: categories.get(String(p.category)) || p.category,
       })) };
     } finally { clearTimeout(timer); }
@@ -467,7 +482,7 @@ function buildFitSchema(productIds) {
 // Один проход к модели. Возвращает либо { parsed, response }, либо
 // { failure } с готовыми полями ответа — вызывающий решает, падать ему
 // или продолжать с тем, что уже есть.
-async function runPass(client, { instructions, input, schema, schemaName, requireItems = true, maxOutputTokens = SHOP_MAX_OUTPUT_TOKENS }) {
+async function runPass(client, { instructions, input, schema, schemaName, requireItems = true, maxOutputTokens = SHOP_MAX_OUTPUT_TOKENS, temperature }) {
   let response;
   try {
     response = await client.responses.create({
@@ -475,6 +490,7 @@ async function runPass(client, { instructions, input, schema, schemaName, requir
       instructions,
       input,
       max_output_tokens: maxOutputTokens,
+      ...(Number.isFinite(temperature) ? { temperature } : {}),
       text: {
         format: { type: 'json_schema', name: schemaName, strict: true, schema },
       },
@@ -946,14 +962,34 @@ export function createAiRoutes({ query } = {}) {
     const conversation = Array.isArray(req.body?.conversation) ? req.body.conversation.slice(-8) : [];
     const startedAt = Date.now();
     const client = getClient(apiKey);
+    const explicitDishRequest = isExplicitDishShoppingRequest(raw.trim());
     let first;
     try {
-      first = await runPass(client, {
-        instructions: buildAssistantInstructions({ conversation }),
-        input: imageAwareInput(raw.trim(), image),
-        schema: assistantSchema,
-        schemaName: 'assistant_intent',
-      });
+      if (explicitDishRequest) {
+        first = await runPass(client, {
+          instructions: buildDishPlanInstructions(conversation), input: imageAwareInput(raw.trim(), image),
+          schema: dishPlanSchema, schemaName: 'dish_ingredient_plan', requireItems: false,
+          maxOutputTokens: 1300, temperature: 0,
+        });
+        if (!first.failure) {
+          const plan = first.parsed;
+          first.parsed = {
+            type: 'shopping', intent: 'meal_planning',
+            message: `Подобрал ингредиенты для блюда «${String(plan.dishName || '').trim()}».`,
+            recipeTitle: '', recipeDescription: '', recipeMinutes: 0, recipeIngredients: [], recipeSteps: [],
+            nutrition: [], seenProducts: [], detectedItems: [], items: [], budget: plan.budget,
+            dishName: plan.dishName, dishIngredients: plan.ingredients, dishExcluded: plan.excluded,
+          };
+        }
+      } else {
+        first = await runPass(client, {
+          instructions: buildAssistantInstructions({ conversation }),
+          input: imageAwareInput(raw.trim(), image),
+          schema: assistantSchema,
+          schemaName: 'assistant_intent',
+          temperature: 0,
+        });
+      }
     } catch (err) {
       return res.status(502).json({ ok: false, reason: 'openai_error', error: scrubKeys(err?.message || 'Не удалось получить ответ.'), tookMs: Date.now() - startedAt });
     }
@@ -962,6 +998,15 @@ export function createAiRoutes({ query } = {}) {
       return res.status(502).json({ ok: false, requestId, ...first.failure, tookMs: Date.now() - startedAt });
     }
     const parsed = first.parsed;
+    if (explicitDishRequest && (!String(parsed.dishName || '').trim() || !Array.isArray(parsed.dishIngredients) || !parsed.dishIngredients.length)) {
+      console.error('[ai/chat] dish planner returned no canonical set', { ...logMeta() });
+      return res.json({
+        ok: true, model: first.response.model || OPENAI_MODEL, aiCalls: 1,
+        usage: { first: first.response.usage || null, second: null, totalTokens: first.response.usage?.total_tokens || 0 },
+        requestId, tookMs: Date.now() - startedAt,
+        result: { type: 'text', intent: 'question', message: 'Не удалось определить состав блюда. Уточните, для какого блюда собрать продукты.', recipe: null, nutrition: [], seenProducts: [], detectedItems: [], items: [], total: 0, budget: null },
+      });
+    }
     if (parsed.type !== 'shopping') {
       return res.json({
         ok: true, model: first.response.model || OPENAI_MODEL, aiCalls: 1,
@@ -980,6 +1025,43 @@ export function createAiRoutes({ query } = {}) {
       return res.status(503).json({ ok: false, reason: 'catalog_unavailable', error: 'Не удалось прочитать каталог.', tookMs: Date.now() - startedAt });
     }
     if (!products.length) return res.status(503).json({ ok: false, reason: 'catalog_empty', error: 'В каталоге нет активных товаров.', tookMs: Date.now() - startedAt });
+
+    const dishName = String(parsed.dishName || '').trim();
+    const dishIngredients = dishName
+      ? getStableDishPlan(dishName, parsed.dishIngredients).filter((item) => !(parsed.dishExcluded || []).some((excluded) => dishIngredientMatchesName(item, excluded)))
+      : [];
+    if (dishName && dishIngredients.length) {
+      const budget = Number.isInteger(parsed.budget) && parsed.budget > 0 ? parsed.budget : null;
+      const basket = matchDishIngredients(products, dishIngredients, budget);
+      const messageParts = [String(parsed.message || `Подобрал продукты для блюда «${dishName}».`).trim()];
+      if (basket.unmatchedRequired.length) messageParts.push(`Сейчас нет в каталоге: ${basket.unmatchedRequired.join(', ')}.`);
+      if (basket.unmatchedOptional.length) messageParts.push(`Не добавлял необязательные продукты: ${basket.unmatchedOptional.join(', ')}.`);
+      if (basket.budgetExceeded) messageParts.push(`Полный обязательный набор не помещается в ${budget} ₽: минимальная стоимость доступных обязательных ингредиентов — ${basket.requiredTotal} ₽.`);
+      console.info('[ai/chat] dish-shopping', {
+        requestId, dish: dishName,
+        requiredIngredients: dishIngredients.filter((x) => x.required).map((x) => ({ canonical: x.canonical, aliases: x.aliases })),
+        optionalIngredients: dishIngredients.filter((x) => !x.required).map((x) => ({ canonical: x.canonical, aliases: x.aliases })),
+        excludedIngredients: parsed.dishExcluded || [],
+        matchedProductIds: basket.items.map((x) => x.productId),
+        unmatchedIngredients: basket.unmatchedRequired,
+        finalBasket: basket.items.map((x) => ({ productId: x.productId, title: x.title, price: x.price })),
+      });
+      const totalTokens = first.response.usage?.total_tokens || 0;
+      return res.json({
+        ok: true, model: first.response.model || OPENAI_MODEL, aiCalls: 1,
+        usage: { first: first.response.usage || null, second: null, totalTokens },
+        requestId, tookMs: Date.now() - startedAt,
+        result: {
+          type: 'shopping', intent: parsed.intent, request: raw.trim(), message: messageParts.filter(Boolean).join(' '),
+          items: basket.items, total: basket.total, budget,
+          withinBudget: budget == null ? null : basket.total <= budget,
+          overBy: budget == null ? 0 : Math.max(0, basket.total - budget),
+          dropped: [], dish: { name: dishName, unmatchedRequired: basket.unmatchedRequired, unmatchedOptional: basket.unmatchedOptional },
+          recipe: null, nutrition: [], seenProducts: [],
+        },
+      });
+    }
+
     const productById = new Map(products.map((p) => [p.id, p]));
     const productIds = products.map((p) => p.id);
     const shop = await runPass(client, {
@@ -1339,6 +1421,19 @@ function buildAssistantInstructions({ catalog = '', conversation = [] } = {}) {
     catalog ? `Для подбора покупок используй только этот реальный каталог:\n${catalog}` : '',
     conversation.length ? `Контекст последних сообщений:\n${conversation.map((x) => `${x.role}: ${x.content}`).join('\n')}` : '',
     'Верни все поля схемы. Для неприменимых полей используй пустую строку, [] или null.',
+  ].filter(Boolean).join('\n\n');
+}
+
+function buildDishPlanInstructions(conversation) {
+  return [
+    'Ты — планировщик ингредиентов для продуктового AI-ассистента. Покупатель явно просит собрать продукты для блюда.',
+    'Определи точное блюдо из запроса и выдай его полный узнаваемый канонический состав. Не выбирай товары и не выдумывай productId, цены или доступность.',
+    'Каждый ингредиент укажи один раз: canonical — понятное название по-русски; aliases — точные пищевые синонимы на русском/английском; required=true для ключевых ингредиентов, без которых блюдо теряет смысл, false для приправ, масел и дополнений.',
+    'Сохраняй подтипы: сладкий перец не равен чили, обычный лук не равен зелёному, томатная паста не является синонимом свежего помидора. Если в рецепте допустима замена цельным продуктом, внеси её отдельным optional ингредиентом.',
+    'Проверь полный состав блюда, не пропуская ключевые продукты. Например, рататуй включает баклажан, кабачок, сладкий перец, томаты и лук; борщ — свёклу, капусту, картофель, морковь, лук и томатный компонент; греческий салат — помидоры, огурцы, сладкий перец, лук, маслины и фету. Для других блюд выводи состав самостоятельно, примеры не ограничивают список.',
+    'Не включай соседние блюда, готовые наборы, гарниры и ингредиенты из переписки, если они не относятся к названному блюду. Явно запрещённые продукты помести в excluded, остальную каноническую основу не меняй.',
+    'dishName — короткое русское название блюда. budget — целое число рублей, только если пользователь явно указал предел; иначе null. Максимум 14 ingredients.',
+    conversation.length ? `Последний контекст (используй только если он уточняет название/ограничения):\n${conversation.map((x) => `${x.role}: ${x.content}`).join('\n')}` : '',
   ].filter(Boolean).join('\n\n');
 }
 
