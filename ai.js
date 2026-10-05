@@ -23,6 +23,7 @@ import express from 'express';
 import multer from 'multer';
 import OpenAI, { toFile } from 'openai';
 import { randomUUID } from 'node:crypto';
+import { findMealDbRecipes, normalizeFood } from './mealRecipes.js';
 
 // Модель задаётся переменной окружения, чтобы менять её без правки кода.
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
@@ -52,6 +53,31 @@ const MAX_MESSAGE_LENGTH = 500;
 // Сколько упаковок одного товара модель может положить в корзину.
 // Защита от «20 кг помидоров» из-за ошибки в рассуждении.
 const MAX_ITEM_QUANTITY = 10;
+
+const recipePlanSchema = {
+  type: 'object', properties: {
+    ingredientEnglish: { type: 'array', items: { type: 'string' } },
+    dishSearch: { type: 'string' },
+    fallback: { type: 'string' },
+  }, required: ['ingredientEnglish', 'dishSearch', 'fallback'], additionalProperties: false,
+};
+
+function recipeCatalogSchema(productIds) {
+  return { type: 'object', properties: {
+    matches: { type: 'array', items: { type: 'object', properties: {
+      ingredient: { type: 'string' }, productId: { type: 'string', enum: ['', ...productIds] },
+    }, required: ['ingredient', 'productId'], additionalProperties: false } },
+    ingredientNames: { type: 'array', items: { type: 'object', properties: {
+      source: { type: 'string' }, russian: { type: 'string' },
+    }, required: ['source', 'russian'], additionalProperties: false } },
+    recipes: { type: 'array', items: { type: 'object', properties: {
+      id: { type: 'string' }, title: { type: 'string' }, description: { type: 'string' }, categoryLabel: { type: 'string' },
+      minutes: { type: 'integer' }, servings: { type: 'string' },
+      ingredientLines: { type: 'array', items: { type: 'string' } },
+      steps: { type: 'array', items: { type: 'string' } },
+    }, required: ['id', 'title', 'description', 'categoryLabel', 'minutes', 'servings', 'ingredientLines', 'steps'], additionalProperties: false } },
+  }, required: ['matches', 'ingredientNames', 'recipes'], additionalProperties: false };
+}
 
 // Описание веса в каталоге — свободный текст, иногда с пояснением
 // («примерно ~6 кг, хватит на 2-3 кастрюли борща»). Модели нужен размер
@@ -146,6 +172,30 @@ const CATALOG_QUERY = `
   WHERE p.is_active = true
   ORDER BY c.sort_order ASC NULLS LAST, p.sort_order ASC, p.title ASC
 `;
+
+async function loadAiCatalog(query) {
+  try { return await query(CATALOG_QUERY); }
+  catch (dbError) {
+    // Isolated preview has no database. It may read the public catalogue only
+    // when explicitly configured; production keeps its normal DB path.
+    const readUrl = process.env.AI_CATALOG_READ_URL;
+    if (!readUrl) throw dbError;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const response = await fetch(readUrl, { signal: controller.signal });
+      if (!response.ok) throw new Error(`Public catalog HTTP ${response.status}`);
+      const catalog = await response.json();
+      if (!Array.isArray(catalog?.products)) throw new Error('Public catalog payload invalid');
+      const categories = new Map((catalog.categories || []).map((c) => [String(c.id), c.label]));
+      return { rows: catalog.products.filter((p) => p.isActive !== false).map((p) => ({
+        id: String(p.id), title: p.title, price: Number(p.price), weight: p.weight,
+        image_url: p.imageUrl || null, category: p.category,
+        category_label: categories.get(String(p.category)) || p.category,
+      })) };
+    } finally { clearTimeout(timer); }
+  }
+}
 
 // Компактная строка товара для модели. Цена в списке нужна, чтобы модель
 // не предлагала корзину, заведомо выходящую за бюджет, — но считает
@@ -417,14 +467,14 @@ function buildFitSchema(productIds) {
 // Один проход к модели. Возвращает либо { parsed, response }, либо
 // { failure } с готовыми полями ответа — вызывающий решает, падать ему
 // или продолжать с тем, что уже есть.
-async function runPass(client, { instructions, input, schema, schemaName }) {
+async function runPass(client, { instructions, input, schema, schemaName, requireItems = true, maxOutputTokens = SHOP_MAX_OUTPUT_TOKENS }) {
   let response;
   try {
     response = await client.responses.create({
       model: OPENAI_MODEL,
       instructions,
       input,
-      max_output_tokens: SHOP_MAX_OUTPUT_TOKENS,
+      max_output_tokens: maxOutputTokens,
       text: {
         format: { type: 'json_schema', name: schemaName, strict: true, schema },
       },
@@ -455,7 +505,7 @@ async function runPass(client, { instructions, input, schema, schemaName }) {
     return { failure: { reason: 'bad_model_json', error: 'Модель вернула ответ не по схеме.' }, response };
   }
 
-  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.items)) {
+  if (!parsed || typeof parsed !== 'object' || (requireItems && !Array.isArray(parsed.items))) {
     console.error('[ai] shop: в ответе нет items');
     return { failure: { reason: 'bad_model_json', error: 'В ответе модели нет списка позиций.' }, response };
   }
@@ -697,7 +747,7 @@ export function createAiRoutes({ query } = {}) {
     // ── Каталог ───────────────────────────────────────────────────────
     let products;
     try {
-      const result = await query(CATALOG_QUERY);
+      const result = await loadAiCatalog(query);
       products = result.rows;
     } catch (err) {
       console.error('[ai] shop: каталог не прочитался:', err?.message ?? err);
@@ -926,7 +976,7 @@ export function createAiRoutes({ query } = {}) {
     }
 
     let products;
-    try { products = (await query(CATALOG_QUERY)).rows; } catch (err) {
+    try { products = (await loadAiCatalog(query)).rows; } catch (err) {
       return res.status(503).json({ ok: false, reason: 'catalog_unavailable', error: 'Не удалось прочитать каталог.', tookMs: Date.now() - startedAt });
     }
     if (!products.length) return res.status(503).json({ ok: false, reason: 'catalog_empty', error: 'В каталоге нет активных товаров.', tookMs: Date.now() - startedAt });
@@ -946,7 +996,7 @@ export function createAiRoutes({ query } = {}) {
       ok: true, model: shop.response.model || OPENAI_MODEL, aiCalls: 2,
       usage: { first: first.response.usage || null, second: shop.response.usage || null, totalTokens: (first.response.usage?.total_tokens || 0) + (shop.response.usage?.total_tokens || 0) },
       requestId, tookMs: Date.now() - startedAt,
-      result: { type: 'shopping', intent: shop.parsed.intent, message: shop.parsed.message, items: basket.items, total: basket.total, budget, withinBudget: budget == null ? null : basket.total <= budget, overBy: budget == null ? 0 : Math.max(0, basket.total - budget), dropped: basket.dropped, recipe: null, nutrition: [], seenProducts: [] },
+      result: { type: 'shopping', intent: shop.parsed.intent, request: raw.trim(), message: shop.parsed.message, items: basket.items, total: basket.total, budget, withinBudget: budget == null ? null : basket.total <= budget, overBy: budget == null ? 0 : Math.max(0, basket.total - budget), dropped: basket.dropped, recipe: null, nutrition: [], seenProducts: [] },
     });
   });
 
@@ -954,6 +1004,72 @@ export function createAiRoutes({ query } = {}) {
      Сначала статусы, потом живой текст ответа, в конце — собранный
      результат. /shop остаётся как есть: им пользуются те, кому поток не
      нужен. */
+  // User-driven recipe lookup: AI names the basket ingredients, TheMealDB supplies real meals.
+  router.post('/recipes', async (req, res) => {
+    const startedAt = Date.now();
+    const queryText = typeof req.body?.query === 'string' ? req.body.query.trim().slice(0, MAX_MESSAGE_LENGTH) : '';
+    const ingredients = Array.isArray(req.body?.ingredients) ? req.body.ingredients.filter((item) => typeof item === 'string').map((item) => item.trim()).filter(Boolean).slice(0, 20) : [];
+    if (!queryText && !ingredients.length) return res.status(400).json({ ok: false, reason: 'bad_request', error: 'query or ingredients is required' });
+    const limit = Math.min(3, Math.max(1, Number(req.body?.limit) || 3));
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return res.status(503).json({ ok: false, reason: 'missing_api_key', error: 'AI недоступен.' });
+    let products = [];
+    try { products = (await loadAiCatalog(query)).rows || []; } catch (err) { console.error('[ai/recipes] catalog lookup failed', { error: err?.message, durationMs: Date.now() - startedAt }); }
+    const plan = await runPass(getClient(apiKey), {
+      instructions: 'Ты готовишь поиск реальных рецептов для продуктового чата. Преврати основные продукты из русских названий каталога в канонические английские названия ингредиентов TheMealDB (например Potatoes, Tomatoes, Aubergine, Yellow Pepper, Apples). Не добавляй продукты, которых нет в корзине. ingredientEnglish — по одному ингредиенту на каждый основной продукт, максимум 5. dishSearch — английское название конкретного блюда из запроса; для общего вопроса оставь пустым. fallback — короткая полезная идея блюда по-русски именно из указанных продуктов. Если запрос о высокобелковом блюде, а продукты не дают белка, скажи об этом честно. Не выдумывай БЖУ.',
+      input: JSON.stringify({ request: queryText, basket: ingredients }), schema: recipePlanSchema, schemaName: 'meal_recipe_plan', requireItems: false,
+    });
+    if (plan.failure) return res.status(502).json({ ok: false, reason: plan.failure.reason, error: plan.failure.error });
+    const english = [...new Set(plan.parsed.ingredientEnglish.map((name) => String(name).trim()).filter(Boolean))].slice(0, 5);
+    const fallback = String(plan.parsed.fallback || '').trim();
+    const provider = { provider: 'TheMealDB', text: 'Рецепты TheMealDB', url: 'https://www.themealdb.com/' };
+    if (!process.env.THEMEALDB_API_KEY) return res.json({ ok: true, recipes: [], fallback, reason: 'themealdb_not_configured', attribution: provider, tookMs: Date.now() - startedAt });
+    try {
+      const recipes = await findMealDbRecipes({ apiKey: process.env.THEMEALDB_API_KEY, basketEnglish: english, dishQuery: String(plan.parsed.dishSearch || '').trim(), limit });
+      if (recipes.length) {
+        const missing = [...new Set(recipes.flatMap((recipe) => recipe.missingIngredients.map((item) => item.food)))].slice(0, 16);
+        const foodNames = [...new Set(recipes.flatMap((recipe) => recipe.ingredients.map((item) => item.food)))].slice(0, 40);
+        const presentation = await runPass(getClient(apiKey), {
+          instructions: 'Оформи ТОЛЬКО эти реальные рецепты TheMealDB для русского интерфейса. recipes: для каждого id переведи название, дай короткое описание на основе category/area и короткий categoryLabel по category. Переведи каждую ingredientLine (включая количество) и каждый sourceStep на русский, сохранив порядок и число элементов. Не придумывай ингредиенты, действия и длительность, которых нет в исходнике. minutes — приблизительное общее время с подготовкой, если его можно разумно вывести из sourceSteps, иначе 0. servings — приблизительное число порций по указанному количеству ингредиентов или пустая строка. ingredientNames: переведи каждый food на русский. matches: сопоставь missing с РЕАЛЬНЫМИ товарами каталога, только точный пищевой эквивалент. Tomato paste → свежие помидоры не эквивалент. Если товара нет, productId = пустая строка. Не выдумывай БЖУ.',
+          input: JSON.stringify({ recipes: recipes.map((recipe) => ({ id: String(recipe.id), title: recipe.label, category: recipe.category, area: recipe.area, ingredientLines: recipe.ingredients.map((item) => item.text), sourceSteps: recipe.sourceSteps })), foodNames, missing, catalog: products.map((p) => ({ id: String(p.id), title: p.title })) }),
+          schema: recipeCatalogSchema(products.map((p) => String(p.id))), schemaName: 'meal_recipe_presentation', requireItems: false, maxOutputTokens: 2600,
+        });
+        const byId = new Map(products.map((p) => [String(p.id), p]));
+        const translations = new Map((presentation.parsed?.ingredientNames || []).map((item) => [normalizeFood(item.source), String(item.russian || '').trim()]));
+        const key = (value) => String(value || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+        const missingByName = new Map(missing.flatMap((name) => [
+          [key(name), normalizeFood(name)],
+          [key(translations.get(normalizeFood(name))), normalizeFood(name)],
+        ]).filter(([name]) => name));
+        const mapped = new Map((presentation.parsed?.matches || [])
+          .filter((item) => missingByName.has(key(item.ingredient)) && byId.has(String(item.productId)))
+          .map((item) => [missingByName.get(key(item.ingredient)), byId.get(String(item.productId))]));
+        const displayById = new Map((presentation.parsed?.recipes || []).map((item) => [String(item.id), item]));
+        for (const recipe of recipes) {
+          const display = displayById.get(String(recipe.id));
+          const localize = (item) => ({ ...item, russian: translations.get(normalizeFood(item.food)) || item.food });
+          recipe.titleRu = String(display?.title || recipe.label).trim();
+          recipe.description = String(display?.description || '').trim();
+          recipe.categoryLabel = String(display?.categoryLabel || recipe.category || '').trim();
+          recipe.minutesEstimate = Number.isInteger(display?.minutes) && display.minutes > 0 && display.minutes <= 240 ? display.minutes : null;
+          recipe.servingsEstimate = String(display?.servings || '').trim().slice(0, 20);
+          recipe.steps = Array.isArray(display?.steps) && display.steps.length >= 2
+            && display.steps.length <= 8 && display.steps.every((step) => /[\u0410-\u042f\u0430-\u044f\u0401\u0451]/u.test(String(step)))
+            ? display.steps.map((step) => String(step).trim()) : recipe.sourceSteps;
+          recipe.ingredients = recipe.ingredients.map((item, index) => ({ ...localize(item), displayText: Array.isArray(display?.ingredientLines) && display.ingredientLines.length === recipe.ingredients.length ? String(display.ingredientLines[index]).trim() : item.text }));
+          recipe.matchedIngredients = recipe.matchedIngredients.map(localize);
+          recipe.catalogMissing = [...new Map(recipe.missingIngredients.map((item) => mapped.get(normalizeFood(item.food))).filter(Boolean).map((p) => [String(p.id), { id: p.id, title: p.title, price: p.price, weight: p.weight, imageUrl: p.image_url || null, quantity: 1 }])).values()];
+          recipe.unavailableMissing = recipe.missingIngredients.filter((item) => !mapped.has(normalizeFood(item.food))).map((item) => translations.get(normalizeFood(item.food)) || item.food);
+          recipe.missingIngredients = recipe.missingIngredients.map(localize);
+        }
+      }
+      return res.json({ ok: true, recipes, fallback: recipes.length ? null : fallback, attribution: provider, tookMs: Date.now() - startedAt });
+    } catch (err) {
+      console.error('[ai/recipes] TheMealDB lookup failed', { code: err?.code, status: err?.status, durationMs: Date.now() - startedAt });
+      return res.json({ ok: true, recipes: [], fallback, reason: err?.code || 'themealdb_unavailable', attribution: provider, tookMs: Date.now() - startedAt });
+    }
+  });
+
   router.post('/chat/stream', async (req, res) => {
     const raw = req.body?.message;
     if (typeof raw !== 'string' || !raw.trim() || raw.length > MAX_MESSAGE_LENGTH) {
@@ -988,7 +1104,7 @@ export function createAiRoutes({ query } = {}) {
     try {
       sse(res, 'stage', { stage: 'thinking' });
 
-      const catalog = await query(CATALOG_QUERY);
+      const catalog = await loadAiCatalog(query);
       const products = catalog.rows;
       if (!products.length) return fail('catalog_empty', 'В каталоге нет активных товаров.');
 
